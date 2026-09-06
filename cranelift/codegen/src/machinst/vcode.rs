@@ -102,6 +102,9 @@ pub struct VCode<I: VCodeInst> {
     /// are safepoints, and only for a subset of those that have an associated
     /// user stack map.
     user_stack_maps: FxHashMap<BackwardsInsnIndex, ir::UserStackMap>,
+    // None marks non-fallible instructions inside a span, for the emitter's
+    // missing-map assertion; they need no extra allocation constraints.
+    nixe_faults: FxHashMap<BackwardsInsnIndex, Option<crate::nixe::Boundary>>,
 
     /// A map from backwards instruction index to the debug tags for
     /// that instruction. Each entry indexes a range in the
@@ -512,6 +515,7 @@ impl<I: VCodeInst> VCodeBuilder<I> {
 
     fn collect_operands(&mut self, vregs: &VRegAllocator<I>) {
         let allocatable = PRegSet::from(self.vcode.abi.machine_env());
+        let num_insts = self.vcode.num_insts();
         for (i, insn) in self.vcode.insts.iter_mut().enumerate() {
             // Push operands from the instruction onto the operand list.
             //
@@ -529,6 +533,10 @@ impl<I: VCodeInst> VCodeBuilder<I> {
                     vregs.resolve_vreg_alias(vreg)
                 });
             insn.get_operands(&mut op_collector);
+            let index = InsnIndex::new(i).to_backwards_insn_index(num_insts);
+            if let Some(Some(fault)) = self.vcode.nixe_faults.get_mut(&index) {
+                fault.fault_operands(&mut op_collector);
+            }
             let (ops, clobbers) = op_collector.finish();
             self.vcode.operand_ranges.push_end(ops);
 
@@ -601,6 +609,15 @@ impl<I: VCodeInst> VCodeBuilder<I> {
         debug_assert!(old_entry.is_none());
     }
 
+    /// Keep prefault operands live through the associated machine instruction.
+    pub(crate) fn add_nixe_fault(
+        &mut self,
+        inst: BackwardsInsnIndex,
+        fault: Option<crate::nixe::Boundary>,
+    ) {
+        assert!(self.vcode.nixe_faults.insert(inst, fault).is_none());
+    }
+
     /// Add debug tags for the associated instruction.
     pub fn add_debug_tags(&mut self, inst: BackwardsInsnIndex, entries: &[ir::DebugTag]) {
         let start = u32::try_from(self.vcode.debug_tag_pool.len()).unwrap();
@@ -628,6 +645,7 @@ impl<I: VCodeInst> VCode<I> {
             vreg_types: vec![],
             insts: Vec::with_capacity(10 * n_blocks),
             user_stack_maps: FxHashMap::default(),
+            nixe_faults: FxHashMap::default(),
             debug_tags: FxHashMap::default(),
             debug_tag_pool: vec![],
             operands: Vec::with_capacity(30 * n_blocks),
@@ -745,7 +763,11 @@ impl<I: VCodeInst> VCode<I> {
     {
         let _tt = timing::vcode_emit();
         let mut buffer = MachBuffer::new();
-        buffer.set_log2_min_function_alignment(self.log2_min_function_alignment);
+        buffer.set_log2_min_function_alignment(if flags.enable_nixe_abi() {
+            self.log2_min_function_alignment.max(3)
+        } else {
+            self.log2_min_function_alignment
+        });
         // Index by VCode block, not emission order: cold blocks move and the
         // Nixe analysis root is omitted altogether.
         let mut bb_starts: Vec<Option<CodeOffset>> = if flags.machine_code_cfg_info() {
@@ -892,6 +914,7 @@ impl<I: VCodeInst> VCode<I> {
                     writeln!(disasm, "  {}", inst.pretty_print_inst(&mut s)).unwrap();
                 }
                 inst.emit(buffer, &self.emit_info, state);
+                buffer.set_nixe_fault(None, false);
                 // The buffer maintains its deadline invariant per-`MachInst`:
                 // after each instruction, ensure that the worst-case end of
                 // any island the buffer might emit lies before the soonest
@@ -938,16 +961,25 @@ impl<I: VCodeInst> VCode<I> {
                 last_offset = Some(cur_offset);
             }
 
+            let native_entry_offset = buffer.cur_offset();
             if let Some(block_start) = I::gen_block_start(
                 self.block_order.is_indirect_branch_target(block),
                 is_forward_edge_cfi_enabled,
             ) {
                 do_emit(&block_start, &mut disasm, &mut buffer, &mut state);
             }
+            let native_body_offset = buffer.cur_offset();
 
             for inst_or_edit in regalloc.block_insts_and_edits(&self, block) {
                 match inst_or_edit {
                     InstOrEdit::Inst(iix) => {
+                        if self.insts[iix.index()].is_nixe_entry()
+                            && buffer.cur_offset() != native_body_offset
+                        {
+                            return Err(CodegenError::Unsupported(
+                                "Nixe entry: executable definitions precede physical inputs".into(),
+                            ));
+                        }
                         if !self.debug_value_labels.is_empty() {
                             // If we need to produce debug info,
                             // record the offset of each instruction
@@ -1054,23 +1086,30 @@ impl<I: VCodeInst> VCode<I> {
                             // Update the operands for this inst using the
                             // allocations from the regalloc result.
                             let mut allocs = regalloc.inst_allocs(iix).iter();
-                            self.insts[iix.index()].get_operands(
-                                &mut |reg: &mut Reg, constraint, _kind, _pos| {
-                                    let alloc =
-                                        allocs.next().expect("enough allocations for all operands");
+                            let mut apply_alloc = |reg: &mut Reg, constraint, _kind, _pos| {
+                                let alloc =
+                                    allocs.next().expect("enough allocations for all operands");
 
-                                    if let Some(alloc) = alloc.as_reg() {
-                                        let alloc: Reg = alloc.into();
-                                        if let OperandConstraint::FixedReg(rreg) = constraint {
-                                            debug_assert_eq!(Reg::from(rreg), alloc);
-                                        }
-                                        *reg = alloc;
-                                    } else if let Some(alloc) = alloc.as_stack() {
-                                        let alloc: Reg = alloc.into();
-                                        *reg = alloc;
+                                if let Some(alloc) = alloc.as_reg() {
+                                    let alloc: Reg = alloc.into();
+                                    if let OperandConstraint::FixedReg(rreg) = constraint {
+                                        debug_assert_eq!(Reg::from(rreg), alloc);
                                     }
-                                },
-                            );
+                                    *reg = alloc;
+                                } else if let Some(alloc) = alloc.as_stack() {
+                                    let alloc: Reg = alloc.into();
+                                    *reg = alloc;
+                                }
+                            };
+                            self.insts[iix.index()].get_operands(&mut apply_alloc);
+                            let index = iix.to_backwards_insn_index(self.num_insts());
+                            if let Some(fault) = self.nixe_faults.remove(&index) {
+                                let map = fault.map(|mut fault| {
+                                    fault.fault_operands(&mut apply_alloc);
+                                    fault.fault_map(self.abi.frame_layout())
+                                });
+                                buffer.set_nixe_fault(map, true);
+                            }
                             debug_assert!(allocs.next().is_none());
 
                             log::trace!("emitting: {:?}", self.insts[iix.index()]);
@@ -1082,6 +1121,12 @@ impl<I: VCodeInst> VCode<I> {
                                 &mut buffer,
                                 &mut state,
                             );
+
+                            if self.insts[iix.index()].is_nixe_entry() {
+                                // Indirect ingress includes its CET/BTI landing
+                                // instruction, which does not change inputs.
+                                buffer.set_nixe_entry_offset(native_entry_offset);
+                            }
 
                             if debug_tag_pos == MachDebugTagPos::Post {
                                 place_debug_tags(&self, debug_tag_pos, &mut buffer);

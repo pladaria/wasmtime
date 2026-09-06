@@ -315,6 +315,8 @@
 
        ;; A pseudoinstruction that serves as a sequence point.
        (SequencePoint)
+       (NixeEndbr64)
+       (NixeBoundary (data BoxNixeBoundary))
 
        ;; An instruction assembled outside of cranelift-codegen.
        (External (inst AssemblerInst))))
@@ -328,6 +330,7 @@
             Size64))
 
 (type BoxCallInfo extern (enum))
+(type BoxNixeBoundary extern (enum))
 (type BoxCallIndInfo extern (enum))
 (type BoxReturnCallInfo extern (enum))
 (type BoxReturnCallIndInfo extern (enum))

@@ -1005,6 +1005,7 @@
 
        ;; A pseudoinstruction that serves as a sequence point.
        (SequencePoint)
+       (NixeBoundary (data BoxNixeBoundary))
 
        ;; Emits an inline stack probe loop.
        ;;
@@ -1336,6 +1337,7 @@
 (type SImm7Scaled (primitive SImm7Scaled))
 
 (type BoxCallInfo (primitive BoxCallInfo))
+(type BoxNixeBoundary (primitive BoxNixeBoundary))
 (type BoxCallIndInfo (primitive BoxCallIndInfo))
 (type BoxReturnCallInfo (primitive BoxReturnCallInfo))
 (type BoxReturnCallIndInfo (primitive BoxReturnCallIndInfo))

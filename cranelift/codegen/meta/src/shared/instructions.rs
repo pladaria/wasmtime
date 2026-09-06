@@ -19,6 +19,76 @@ fn define_control_flow(
 ) {
     ig.push(
         Inst::new(
+            "nixe_entry",
+            r#"
+        Define simultaneous physical inputs of a Nixe fast entry.
+
+        The signature has no parameters; its returns specify input value types,
+        not a system ABI. Final allocation chooses all input locations, including
+        spills, and exports them in nixe_states at this instruction's offset.
+        The caller builds canonical adapters and fast bridges to that contract.
+        This instruction must be first in an external entry and emits no bytes.
+        It is not a call and has no runtime selector or frame setup.
+        "#,
+            &formats.nixe_entry,
+        )
+        .operands_in(vec![
+            Operand::new("sig_ref", &entities.sig_ref),
+            Operand::new("imm", &imm.imm64),
+        ])
+        .operands_out(vec![Operand::new("values", &entities.varargs)])
+        .other_side_effects(),
+    );
+
+    for (name, terminal) in [
+        ("nixe_state", false),
+        ("nixe_exit", true),
+        ("nixe_fault_start", false),
+        ("nixe_fault_end", false),
+    ] {
+        let instruction = Inst::new(
+            name,
+            r#"
+        Nixe native-boundary state in caller-defined operand order.
+
+        Keeps every operand live through final allocation and exports its
+        exact register or NativeFrame-relative spill location. The opaque
+        nonnegative ID must be unique in the compiled function. Requires
+        enable_nixe_abi on Linux x86-64 or AArch64.
+
+        nixe_state emits no bytes. Its map describes this point only, not a
+        subsequent instruction after allocator edits. nixe_exit terminates
+        the fragment in an aligned, fixed-size patch unit, initially trapping.
+        The owner must patch every exit to its fallback before publication.
+        Neither instruction implements guest semantics or a system-ABI call.
+
+        nixe_fault_start retains prefault operands through the matching
+        nixe_fault_end with the same ID and no operands, in one basic block.
+        These zero-byte delimiters surround ordinary CLIF memory operations;
+        each emitted fault instruction receives its own final allocation map.
+        Spans cannot nest or contain control transfers or other Nixe boundaries.
+        They must contain at least one trapping memory operation; memory
+        operations marked notrap are rejected because they may move or lack
+        fault-PC metadata. Non-memory trapping operations are not supported.
+        The owner supplies only prefault values, never results defined inside
+        the span, and remains responsible for compound-access commit semantics.
+        "#,
+            &formats.nixe_boundary,
+        )
+        .operands_in(vec![
+            Operand::new("imm", &imm.imm64),
+            Operand::new("args", &entities.varargs),
+        ])
+        .other_side_effects();
+        ig.push(if terminal {
+            instruction.terminates_block()
+        } else {
+            instruction
+        });
+    }
+
+    ig.push(
+        Inst::new(
             "jump",
             r#"
         Jump.

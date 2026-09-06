@@ -22,6 +22,8 @@ pub(crate) struct Formats {
     pub(crate) load: Rc<InstructionFormat>,
     pub(crate) load_no_offset: Rc<InstructionFormat>,
     pub(crate) multiary: Rc<InstructionFormat>,
+    pub(crate) nixe_boundary: Rc<InstructionFormat>,
+    pub(crate) nixe_entry: Rc<InstructionFormat>,
     pub(crate) nullary: Rc<InstructionFormat>,
     pub(crate) shuffle: Rc<InstructionFormat>,
     pub(crate) stack_addr: Rc<InstructionFormat>,
@@ -85,6 +87,14 @@ impl Formats {
             // Catch-all for instructions with many outputs and inputs and no immediate
             // operands.
             multiary: Builder::new("MultiAry").varargs().build(),
+            nixe_boundary: Builder::new("NixeBoundary")
+                .imm(&imm.imm64)
+                .varargs()
+                .build(),
+            nixe_entry: Builder::new("NixeEntry")
+                .imm(&entities.sig_ref)
+                .imm(&imm.imm64)
+                .build(),
 
             nullary: Builder::new("NullAry").build(),
 

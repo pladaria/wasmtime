@@ -361,6 +361,10 @@ pub struct MachBuffer<I: VCodeInst> {
     /// runtime state given a view of an active stack frame.
     frame_layout: Option<MachBufferFrameLayout>,
     nixe_entries: Vec<(ir::Block, CodeOffset)>,
+    nixe_states: Vec<crate::nixe::StateMap>,
+    nixe_faults: Vec<crate::nixe::StateMap>,
+    active_nixe_fault: Option<crate::nixe::StateMap>,
+    in_nixe_fault_span: bool,
 }
 
 impl MachBufferFinalized<Stencil> {
@@ -385,6 +389,8 @@ impl MachBufferFinalized<Stencil> {
             alignment: self.alignment,
             frame_layout: self.frame_layout,
             nixe_entries: self.nixe_entries,
+            nixe_states: self.nixe_states,
+            nixe_faults: self.nixe_faults,
             nop_units: self.nop_units,
         }
     }
@@ -429,6 +435,10 @@ pub struct MachBufferFinalized<T: CompilePhase> {
     pub(crate) frame_layout: Option<MachBufferFrameLayout>,
     /// Selected canonical entry offsets, including entry allocator edits.
     pub nixe_entries: Vec<(ir::Block, CodeOffset)>,
+    /// Exact Nixe boundary allocations in emission order, independent of debug info.
+    pub nixe_states: Vec<crate::nixe::StateMap>,
+    /// Prefault allocations at the exact native PCs registered by the emitter.
+    pub nixe_faults: Vec<crate::nixe::StateMap>,
     /// Any unwind info at a given location.
     pub unwind_info: SmallVec<[(CodeOffset, UnwindInst); 8]>,
     /// The required alignment of this buffer.
@@ -535,6 +545,10 @@ impl<I: VCodeInst> MachBuffer<I> {
             open_patchable: false,
             frame_layout: None,
             nixe_entries: Vec::new(),
+            nixe_states: Vec::new(),
+            nixe_faults: Vec::new(),
+            active_nixe_fault: None,
+            in_nixe_fault_span: false,
         }
     }
 
@@ -1684,6 +1698,8 @@ impl<I: VCodeInst> MachBuffer<I> {
             frame_layout: self.frame_layout,
             nop_units: I::gen_nop_units(),
             nixe_entries: self.nixe_entries,
+            nixe_states: self.nixe_states,
+            nixe_faults: self.nixe_faults,
         }
     }
 
@@ -1749,6 +1765,14 @@ impl<I: VCodeInst> MachBuffer<I> {
 
     /// Add a trap record at the current offset.
     pub fn add_trap(&mut self, code: TrapCode) {
+        assert!(
+            !self.in_nixe_fault_span || self.active_nixe_fault.is_some(),
+            "Nixe memory trap was not given allocation-visible prefault operands"
+        );
+        if let Some(mut state) = self.active_nixe_fault.clone() {
+            state.offset = self.cur_offset();
+            self.nixe_faults.push(state);
+        }
         self.traps.push(MachTrap {
             offset: self.data.len() as CodeOffset,
             code,
@@ -1880,6 +1904,24 @@ impl<I: VCodeInst> MachBuffer<I> {
 
     pub(crate) fn set_nixe_entries(&mut self, entries: Vec<(ir::Block, CodeOffset)>) {
         self.nixe_entries = entries;
+    }
+
+    pub(crate) fn set_nixe_fault(&mut self, state: Option<crate::nixe::StateMap>, in_span: bool) {
+        self.active_nixe_fault = state;
+        self.in_nixe_fault_span = in_span;
+    }
+
+    pub(crate) fn push_nixe_state(&mut self, state: crate::nixe::StateMap) {
+        // A zero-byte boundary fixes this exact location. Later label binding
+        // must not truncate a preceding branch and move the recorded point.
+        self.latest_branches.clear();
+        self.nixe_states.push(state);
+    }
+
+    pub(crate) fn set_nixe_entry_offset(&mut self, offset: CodeOffset) {
+        let entry = self.nixe_states.last_mut().unwrap();
+        assert!(entry.entry);
+        entry.offset = offset;
     }
 }
 

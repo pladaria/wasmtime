@@ -36,6 +36,7 @@ use alloc::vec::Vec;
 use core::u32;
 use regalloc2::PReg;
 
+type BoxNixeBoundary = Box<crate::nixe::Boundary>;
 type BoxCallInfo = Box<CallInfo<ExternalName>>;
 type BoxCallIndInfo = Box<CallInfo<Reg>>;
 type BoxReturnCallInfo = Box<ReturnCallInfo<ExternalName>>;

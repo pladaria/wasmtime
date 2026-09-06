@@ -505,6 +505,7 @@ use_colocated_libcalls = false
 enable_nan_canonicalization = false
 enable_pinned_reg = false
 enable_nixe_abi = false
+enable_nixe_ibt = false
 enable_llvm_abi_extensions = false
 enable_multi_ret_implicit_sret = false
 unwind_info = true

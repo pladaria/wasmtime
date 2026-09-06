@@ -206,6 +206,13 @@ pub struct FunctionStencil {
     /// Entries have no block parameters and define their own live inputs.
     pub nixe_entries: alloc::vec::Vec<Block>,
 
+    /// Optional physical constraints keyed by `nixe_entry`'s opaque ID, in
+    /// original result order. Omitted entries use allocation-chosen locations.
+    /// Set before compilation; validation rejects missing IDs, wrong arity,
+    /// register-bank mismatches, reserved registers and overlapping inputs.
+    pub nixe_entry_constraints:
+        alloc::collections::BTreeMap<u64, alloc::vec::Vec<crate::nixe::EntryConstraint>>,
+
     /// An optional global value which represents an expression evaluating to
     /// the stack limit for this function. This `GlobalValue` will be
     /// interpreted in the prologue, if necessary, to insert a stack check to
@@ -225,6 +232,7 @@ impl FunctionStencil {
         self.srclocs.clear();
         self.debug_tags.clear();
         self.nixe_entries.clear();
+        self.nixe_entry_constraints.clear();
         self.stack_limit = None;
     }
 
@@ -427,6 +435,7 @@ impl Function {
                 stack_limit: None,
                 debug_tags: DebugTags::default(),
                 nixe_entries: alloc::vec::Vec::new(),
+                nixe_entry_constraints: alloc::collections::BTreeMap::new(),
             },
             params: FunctionParameters::new(),
         }

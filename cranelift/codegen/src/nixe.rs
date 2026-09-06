@@ -1,13 +1,20 @@
-//! Initial, opt-in Nixe leaf-fragment ABI.
+//! Opt-in Nixe leaf-fragment ABI.
 //!
 //! This is not a system calling convention. The caller owns every register
 //! and places a 64-byte-aligned spill area at offset zero of NativeFrame,
-//! addressed by r15 (x86-64) or x21 (AArch64). Canonical external entries define
-//! their own inputs. Production gateways, physical fast-entry contracts and
-//! boundary state maps are not implemented here yet.
+//! addressed by r15 (x86-64) or x21 (AArch64). `nixe_entry` defines simultaneous
+//! fast inputs; `nixe_state` and `nixe_exit` retain boundary values through
+//! allocation. Final locations and aligned exit patches are exported through
+//! `MachBufferFinalized::nixe_states`. The owner builds canonical adapters and
+//! bridges from these contracts. A marker map does not describe a later fault;
+//! `nixe_fault_start`/`nixe_fault_end` attach exact prefault maps to the ordinary
+//! memory lowering. The production gateway remains owner-provided.
 
 use crate::{CodegenError, CodegenResult, ir, isa::TargetIsa};
 use alloc::format;
+
+mod boundary;
+pub use boundary::{Boundary, EntryConstraint, LocatedValue, Location, StateMap};
 
 /// Bytes reserved for boundary transfers; never allocated to backend spills.
 pub const TRANSFER_BYTES: u32 = 2048;
@@ -125,8 +132,167 @@ pub(crate) fn validate_entries(func: &ir::Function, isa: &dyn TargetIsa) -> Code
 #[cfg(all(test, feature = "x86", feature = "arm64"))]
 mod multi_entry;
 
+#[cfg(all(test, feature = "x86", feature = "arm64"))]
+mod boundary_tests;
+
+#[cfg(all(test, feature = "x86", feature = "arm64"))]
+mod chaining_tests;
+
 pub(crate) fn validate(func: &ir::Function, isa: &dyn TargetIsa) -> CodegenResult<()> {
+    if isa.flags().enable_nixe_ibt() && (!isa.flags().enable_nixe_abi() || isa.name() != "x64") {
+        return Err(CodegenError::Unsupported(
+            "Nixe IBT requires the x86-64 Nixe ABI".into(),
+        ));
+    }
     validate_entries(func, isa)?;
+    let mut boundary_ids = alloc::collections::BTreeSet::new();
+    let mut entry_ids = alloc::collections::BTreeSet::new();
+    for block in func.layout.blocks() {
+        let mut fault_span = None;
+        let mut fault_has_memory = false;
+        for inst in func.layout.block_insts(block) {
+            let op = func.dfg.insts[inst].opcode();
+            if fault_span.is_some() && (op.is_terminator() || op.is_call()) {
+                return Err(CodegenError::Unsupported(
+                    "Nixe fault span cannot cross control flow".into(),
+                ));
+            }
+            if let ir::InstructionData::NixeBoundary { imm, .. } = func.dfg.insts[inst] {
+                if op == ir::Opcode::NixeFaultEnd {
+                    if fault_span.take() != Some(imm.bits()) || !func.dfg.inst_args(inst).is_empty()
+                    {
+                        return Err(CodegenError::Unsupported(
+                            "Nixe fault end must match one start and have no operands".into(),
+                        ));
+                    }
+                    if !fault_has_memory {
+                        return Err(CodegenError::Unsupported(
+                            "Nixe fault span requires a trapping memory operation".into(),
+                        ));
+                    }
+                    continue;
+                }
+                if fault_span.is_some() {
+                    return Err(CodegenError::Unsupported(
+                        "Nixe fault spans cannot nest or contain other boundaries".into(),
+                    ));
+                }
+                if op == ir::Opcode::NixeFaultStart {
+                    fault_span = Some(imm.bits());
+                    fault_has_memory = false;
+                }
+            }
+            if fault_span.is_some() {
+                if let Some(flags) = func.dfg.insts[inst].memflags_data(&func.dfg) {
+                    if flags.trap_code().is_none() {
+                        return Err(CodegenError::Unsupported(
+                            "Nixe fault span memory operations cannot be notrap".into(),
+                        ));
+                    }
+                    fault_has_memory = true;
+                } else if op.can_trap() {
+                    return Err(CodegenError::Unsupported(
+                        "Nixe fault span cannot contain non-memory traps".into(),
+                    ));
+                }
+                if op == ir::Opcode::NixeEntry {
+                    return Err(CodegenError::Unsupported(
+                        "Nixe fault span cannot contain an entry".into(),
+                    ));
+                }
+            }
+            if let ir::InstructionData::NixeBoundary { imm, .. }
+            | ir::InstructionData::NixeEntry { imm, .. } = func.dfg.insts[inst]
+            {
+                if !isa.flags().enable_nixe_abi()
+                    || imm.bits() < 0
+                    || !boundary_ids.insert(imm.bits())
+                {
+                    return Err(CodegenError::Unsupported(
+                        "Nixe boundary: requires Nixe ABI and unique nonnegative IDs".into(),
+                    ));
+                }
+                if let ir::InstructionData::NixeEntry { sig_ref, .. } = func.dfg.insts[inst] {
+                    let id = imm.bits() as u64;
+                    entry_ids.insert(id);
+                    if let Some(constraints) = func.nixe_entry_constraints.get(&id) {
+                        let results = func.dfg.inst_results(inst);
+                        if constraints.len() != results.len() {
+                            return Err(CodegenError::Unsupported(
+                                "Nixe entry constraints must match result count".into(),
+                            ));
+                        }
+                        for (i, (&value, constraint)) in results.iter().zip(constraints).enumerate()
+                        {
+                            if let EntryConstraint::Register { index, vector } = *constraint {
+                                let ty = func.dfg.value_type(value);
+                                let valid = match (isa.name(), vector) {
+                                    ("x64", false) => {
+                                        index < 16 && !matches!(index, 4 | 5 | 11 | 13 | 14 | 15)
+                                    }
+                                    ("x64", true) => index < 16,
+                                    ("aarch64", false) => index < 29 && !matches!(index, 16..=21),
+                                    ("aarch64", true) => index < 32,
+                                    _ => false,
+                                };
+                                if !valid || vector == ty.is_int() {
+                                    return Err(CodegenError::Unsupported(
+                                        "Nixe entry constraint has invalid register or bank".into(),
+                                    ));
+                                }
+                                if constraints[..i].contains(constraint) {
+                                    return Err(CodegenError::Unsupported(
+                                        "Nixe entry inputs cannot overlap physical registers"
+                                            .into(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    if !func.dfg.signatures[sig_ref].params.is_empty()
+                        || func.layout.first_inst(block) != Some(inst)
+                        || !(func.nixe_entries.contains(&block)
+                            || (func.nixe_entries.is_empty()
+                                && func.layout.entry_block() == Some(block)))
+                    {
+                        return Err(CodegenError::Unsupported(
+                            "Nixe entry must define all inputs first in an external entry".into(),
+                        ));
+                    }
+                }
+                for &value in func
+                    .dfg
+                    .inst_args(inst)
+                    .iter()
+                    .chain(func.dfg.inst_results(inst))
+                {
+                    let ty = func.dfg.value_type(value);
+                    if !((ty.is_int() && ty.bits() <= 64)
+                        || matches!(ty, ir::types::F32 | ir::types::F64)
+                        || (ty.is_vector() && ty.bits() == 128))
+                    {
+                        return Err(CodegenError::Unsupported(
+                            "Nixe boundary: unsupported physical operand type".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        if fault_span.is_some() {
+            return Err(CodegenError::Unsupported(
+                "Nixe fault start has no matching end".into(),
+            ));
+        }
+    }
+    if func
+        .nixe_entry_constraints
+        .keys()
+        .any(|id| !entry_ids.contains(id))
+    {
+        return Err(CodegenError::Unsupported(
+            "Nixe entry constraints name a missing entry ID".into(),
+        ));
+    }
     if !isa.flags().enable_nixe_abi() {
         return Ok(());
     }
@@ -213,6 +379,7 @@ mod tests {
             .set("enable_nixe_abi", if nixe { "true" } else { "false" })
             .unwrap();
         flags.set("regalloc_algorithm", allocator).unwrap();
+        flags.set("regalloc_checker", "true").unwrap();
         flags.set("machine_code_cfg_info", "true").unwrap();
         flags
             .set(

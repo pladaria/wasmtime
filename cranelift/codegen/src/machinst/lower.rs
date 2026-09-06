@@ -717,6 +717,15 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         ctrl_plane: &mut ControlPlane,
     ) -> CodegenResult<()> {
         self.cur_scan_entry_color = Some(self.block_end_colors[block]);
+        let mut nixe_fault = None;
+        // Pairs were validated in source order. Pop their starts in reverse
+        // order instead of rescanning the block for every memory operation.
+        let mut nixe_fault_starts = Vec::new();
+        if self.flags.enable_nixe_abi() {
+            nixe_fault_starts.extend(self.f.layout.block_insts(block).filter(|&inst| {
+                self.f.dfg.insts[inst].opcode() == crate::ir::Opcode::NixeFaultStart
+            }));
+        }
         // Lowering loop:
         // - For each non-branch instruction, in reverse order:
         //   - If side-effecting (load, store, branch/call/return,
@@ -765,6 +774,22 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             self.cur_inst = Some(inst);
             if has_side_effect {
                 self.cur_scan_entry_color = Some(entry_color);
+            }
+
+            // Fault delimiters bracket ordinary lowering. Their state operands
+            // become real uses at each fallible memory instruction. Compound
+            // ops require late uses to protect against internal definitions.
+            match self.f.dfg.insts[inst].opcode() {
+                crate::ir::Opcode::NixeFaultEnd => {
+                    let start = nixe_fault_starts.pop().expect("validated Nixe fault pair");
+                    nixe_fault = Some(crate::nixe::Boundary::lower(self, start).unwrap().0);
+                    continue;
+                }
+                crate::ir::Opcode::NixeFaultStart => {
+                    nixe_fault = None;
+                    continue;
+                }
+                _ => {}
             }
 
             // Skip lowering branches; these are handled separately
@@ -825,6 +850,19 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             let start = self.vcode.vcode.num_insts();
             let loc = self.srcloc(inst);
             self.finish_ir_inst(loc);
+
+            if let Some(fault) = &nixe_fault {
+                for index in start..self.vcode.vcode.num_insts() {
+                    let inst = &self.vcode.vcode[InsnIndex::new(index)];
+                    let state = inst.nixe_fault_operand_pos().map(|pos| {
+                        let mut state = (**fault).clone();
+                        state.fault_pos = pos;
+                        state
+                    });
+                    self.vcode
+                        .add_nixe_fault(BackwardsInsnIndex::new(index), state);
+                }
+            }
 
             // If the instruction had a user stack map, forward it from the CLIF
             // to the vcode.
@@ -1212,6 +1250,13 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             ValueUseState::Unused => true,
             _ => false,
         }
+    }
+
+    /// Whether a result has a consumer in the machine code already lowered
+    /// backwards from this definition. Nixe ingress need not initialize results
+    /// eliminated by instruction selection, even without an IR DCE pass.
+    pub(crate) fn nixe_result_is_used(&self, inst: Inst, index: usize) -> bool {
+        self.value_lowered_uses[self.f.dfg.inst_results(inst)[index]] != 0
     }
 
     pub fn block_successor_label(&self, block: Block, succ: usize) -> MachLabel {

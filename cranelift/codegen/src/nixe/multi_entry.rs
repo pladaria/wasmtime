@@ -316,7 +316,7 @@ fn two_entries_and_one_shared_body_survive_both_compiler_profiles() {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-mod native {
+pub(crate) mod native {
     use super::*;
     use core::ffi::c_void;
 
@@ -380,7 +380,7 @@ mod native {
     );
 
     unsafe extern "C" {
-        fn nixe_probe_enter(frame: *mut u64, entry: *const u8, poison: u64);
+        pub(crate) fn nixe_probe_enter(frame: *mut u64, entry: *const u8, poison: u64);
         fn mmap(
             addr: *mut c_void,
             len: usize,
@@ -393,13 +393,13 @@ mod native {
         fn munmap(addr: *mut c_void, len: usize) -> i32;
     }
 
-    struct Executable {
-        ptr: *mut c_void,
+    pub(crate) struct Executable {
+        pub(crate) ptr: *mut c_void,
         len: usize,
     }
 
     impl Executable {
-        fn new(bytes: &[u8]) -> Self {
+        pub(crate) fn new(bytes: &[u8]) -> Self {
             // Linux x86-64 constants: PROT_READ|WRITE, MAP_PRIVATE|ANONYMOUS.
             // SAFETY: anonymous allocation, checked before copying; permissions
             // become RX before execution and never RWX. No external relocations.

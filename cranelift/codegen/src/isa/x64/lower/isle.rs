@@ -29,6 +29,7 @@ use regalloc2::PReg;
 /// call instruction is also used by Winch to emit calls, but the
 /// `Box<CallInfo>` field is not used, it's only used by Cranelift. By making it
 /// optional, we reduce the number of heap allocations in Winch.
+type BoxNixeBoundary = Box<crate::nixe::Boundary>;
 type BoxCallInfo = Box<CallInfo<ExternalName>>;
 type BoxCallIndInfo = Box<CallInfo<RegMem>>;
 type BoxReturnCallInfo = Box<ReturnCallInfo<ExternalName>>;

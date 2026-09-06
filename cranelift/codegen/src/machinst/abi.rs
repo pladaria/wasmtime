@@ -825,8 +825,12 @@ impl SigSet {
         };
 
         sigs.make_abi_sig_from_ir_signature::<M>(func.signature.clone(), flags)?;
-        for sig_ref in func.dfg.signatures.keys() {
-            sigs.make_abi_sig_from_ir_sig_ref::<M>(sig_ref, &func.dfg, flags)?;
+        // Nixe leaf units reject CLIF calls before lowering. Their imported
+        // signatures describe native-entry value types, not system ABI returns.
+        if !flags.enable_nixe_abi() {
+            for sig_ref in func.dfg.signatures.keys() {
+                sigs.make_abi_sig_from_ir_sig_ref::<M>(sig_ref, &func.dfg, flags)?;
+            }
         }
 
         Ok(sigs)
@@ -1548,7 +1552,7 @@ impl<M: ABIMachineSpec> Callee<M> {
     }
 
     pub fn is_forward_edge_cfi_enabled(&self) -> bool {
-        self.isa_flags.is_forward_edge_cfi_enabled()
+        self.isa_flags.is_forward_edge_cfi_enabled() || self.flags.enable_nixe_ibt()
     }
 
     /// Get the calling convention implemented by this ABI object.

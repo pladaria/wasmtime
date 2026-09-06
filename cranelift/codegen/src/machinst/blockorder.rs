@@ -167,6 +167,12 @@ impl BlockLoweringOrder {
         let mut indirect_branch_target_clif_blocks = FxHashSet::default();
 
         for block in f.layout.blocks() {
+            if f.layout
+                .first_inst(block)
+                .is_some_and(|inst| f.dfg.insts[inst].opcode() == Opcode::NixeEntry)
+            {
+                indirect_branch_target_clif_blocks.insert(block);
+            }
             let start = block_succs.len();
             visit_block_succs(f, block, |_, succ, from_table| {
                 block_out_count[block] += 1;

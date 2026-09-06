@@ -133,6 +133,13 @@ pub(crate) fn define() -> SettingGroup {
         false,
     );
 
+    settings.add_bool(
+        "enable_nixe_ibt",
+        "Emit ENDBR64 at Nixe indirect entries.",
+        "Requires enable_nixe_abi on x86-64. The runtime owns CET/IBT policy; this flag only selects landing instructions.",
+        false,
+    );
+
     settings.add_enum(
         "tls_model",
         "Defines the model used to perform TLS accesses.",
