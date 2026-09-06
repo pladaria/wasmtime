@@ -1827,6 +1827,23 @@ pub(crate) fn emit(
         Inst::SequencePoint { .. } => {
             // Nothing.
         }
+        Inst::NixeEndbr64 => {
+            // Intel SDM, ENDBR64: jump/call landing, no register or flag effects.
+            // https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
+            sink.put_data(&[0xf3, 0x0f, 0x1e, 0xfa]);
+        }
+        Inst::NixeBoundary { data } => {
+            if data.exit {
+                while sink.cur_offset() % 8 != 0 {
+                    sink.put1(0x90);
+                }
+            }
+            data.record(sink, state.frame_layout(), 8);
+            if data.exit {
+                // Unpublished exit. Its owner installs jmp rel32 + padding.
+                sink.put_data(&[0x0f, 0x0b, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90]);
+            }
+        }
 
         Inst::External { inst } => {
             let frame = state.frame_layout();

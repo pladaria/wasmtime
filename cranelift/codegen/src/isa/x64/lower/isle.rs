@@ -29,6 +29,7 @@ use regalloc2::PReg;
 /// call instruction is also used by Winch to emit calls, but the
 /// `Box<CallInfo>` field is not used, it's only used by Cranelift. By making it
 /// optional, we reduce the number of heap allocations in Winch.
+type BoxNixeBoundary = Box<crate::nixe::Boundary>;
 type BoxCallInfo = Box<CallInfo<ExternalName>>;
 type BoxCallIndInfo = Box<CallInfo<RegMem>>;
 type BoxReturnCallInfo = Box<ReturnCallInfo<ExternalName>>;
@@ -738,6 +739,14 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
 
     #[inline]
     fn synthetic_amode_slot(&mut self, offset: i32) -> SyntheticAmode {
+        if self.backend.flags.enable_nixe_abi() {
+            return SyntheticAmode::Real(Amode::imm_reg(
+                offset
+                    .checked_add(crate::nixe::TRANSFER_BYTES as i32)
+                    .unwrap(),
+                regs::r15(),
+            ));
+        }
         SyntheticAmode::SlotOffset { simm32: offset }
     }
 

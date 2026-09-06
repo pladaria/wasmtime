@@ -1471,6 +1471,52 @@ impl<'a> Parser<'a> {
     fn parse_preamble(&mut self, ctx: &mut Context) -> ParseResult<()> {
         loop {
             match self.token() {
+                Some(Token::Identifier("nixe_inputs")) => {
+                    use cranelift_codegen::nixe::EntryConstraint;
+                    self.consume();
+                    let id: u64 = self.match_uimm64("expected Nixe entry ID")?.into();
+                    self.match_token(Token::Equal, "expected '=' after entry ID")?;
+                    self.match_token(Token::LBracket, "expected '[' before entry constraints")?;
+                    let mut constraints = Vec::new();
+                    if !self.optional(Token::RBracket) {
+                        loop {
+                            let constraint = match self.token() {
+                                Some(Token::Identifier("any")) => {
+                                    self.consume();
+                                    EntryConstraint::Any
+                                }
+                                Some(Token::Identifier(bank @ ("integer" | "vector"))) => {
+                                    self.consume();
+                                    EntryConstraint::Register {
+                                        index: self
+                                            .match_uimm8("expected hardware register number")?,
+                                        vector: bank == "vector",
+                                    }
+                                }
+                                _ => {
+                                    return err!(
+                                        self.loc,
+                                        "expected any, integer or vector constraint"
+                                    );
+                                }
+                            };
+                            constraints.push(constraint);
+                            if self.optional(Token::RBracket) {
+                                break;
+                            }
+                            self.match_token(Token::Comma, "expected ',' between constraints")?;
+                        }
+                    }
+                    if ctx
+                        .function
+                        .nixe_entry_constraints
+                        .insert(id, constraints)
+                        .is_some()
+                    {
+                        return err!(self.loc, "duplicate Nixe entry constraint ID");
+                    }
+                    Ok(())
+                }
                 Some(Token::StackSlot(..)) => {
                     self.start_gathering_comments();
                     let loc = self.loc;
@@ -2774,6 +2820,29 @@ impl<'a> Parser<'a> {
                     args: args.into_value_list(&[], &mut ctx.function.dfg.value_lists),
                 }
             }
+            InstructionFormat::NixeBoundary => {
+                let imm = self.match_imm64("expected Nixe boundary identity")?;
+                let args = if self.optional(Token::Comma) {
+                    self.parse_value_list()?
+                } else {
+                    VariableArgs::new()
+                };
+                InstructionData::NixeBoundary {
+                    opcode,
+                    imm,
+                    args: args.into_value_list(&[], &mut ctx.function.dfg.value_lists),
+                }
+            }
+            InstructionFormat::NixeEntry => {
+                let sig_ref = self.match_sig("expected Nixe entry signature")?;
+                self.match_token(Token::Comma, "expected comma after entry signature")?;
+                let imm = self.match_imm64("expected Nixe entry identity")?;
+                InstructionData::NixeEntry {
+                    opcode,
+                    sig_ref,
+                    imm,
+                }
+            }
             InstructionFormat::NullAry => InstructionData::NullAry { opcode },
             InstructionFormat::Jump => {
                 // Parse the destination block number.
@@ -3732,6 +3801,53 @@ mod tests {
         assert_eq!(parse("[1 2]", I32X2).to_string(), "0x0000000200000001");
         assert_eq!(parse("[1 2 3 4]", I8X4).to_string(), "0x04030201");
         assert_eq!(parse("[1 2]", I8X2).to_string(), "0x0201");
+    }
+
+    #[test]
+    fn parse_nixe_boundaries_roundtrip() {
+        let code = "function %test() {\n    nixe_inputs 1 = [integer 2, vector 7]\n    sig0 = () -> i64, i8x16\nblock0:\n    v0, v1 = nixe_entry sig0, 1\n    nixe_state 2, v0, v1\n    nixe_fault_start 4, v0, v1\n    v2 = load.i64 v0\n    nixe_fault_end 4\n    nixe_exit 3, v2, v1\n}";
+        let func = Parser::new(code).parse_function().unwrap().0;
+        let printed = func.display().to_string();
+        let reparsed = Parser::new(&printed).parse_function().unwrap().0;
+        assert_eq!(printed, reparsed.display().to_string());
+    }
+
+    #[test]
+    fn parse_nixe_entry_constraints() {
+        use cranelift_codegen::nixe::EntryConstraint::{Any, Register};
+        let declarations = "nixe_inputs 1 = [any, integer 2, vector 7]\n nixe_inputs 2 = []";
+        let code = format!("function %test() {{\n{declarations}\nblock0:\n return\n}}");
+        let func = Parser::new(&code).parse_function().unwrap().0;
+        assert_eq!(
+            func.nixe_entry_constraints[&1],
+            [
+                Any,
+                Register {
+                    index: 2,
+                    vector: false
+                },
+                Register {
+                    index: 7,
+                    vector: true
+                }
+            ]
+        );
+        assert!(func.nixe_entry_constraints[&2].is_empty());
+        let printed = func.display().to_string();
+        let reparsed = Parser::new(&printed).parse_function().unwrap().0;
+        assert_eq!(func.nixe_entry_constraints, reparsed.nixe_entry_constraints);
+        for declarations in [
+            "nixe_inputs 1 = [spill 2048]",
+            "nixe_inputs 1 = [integer 256]",
+            "nixe_inputs 1 = [any any]",
+            "nixe_inputs 1 = []\n nixe_inputs 1 = []",
+        ] {
+            let code = format!("function %test() {{\n{declarations}\nblock0:\n return\n}}");
+            assert!(
+                Parser::new(&code).parse_function().is_err(),
+                "{declarations}"
+            );
+        }
     }
 
     #[test]

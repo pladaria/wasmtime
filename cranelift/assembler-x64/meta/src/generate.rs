@@ -88,6 +88,26 @@ fn generate_inst_impls(f: &mut Formatter, insts: &[dsl::Inst]) {
         f.add_block("pub fn num_registers_available(&self) -> usize", |f| {
             match_variants(f, insts, "num_registers_available()");
         });
+        f.comment("Memory fault annotation, independent of register allocation.");
+        f.add_block("pub fn memory_trap(&self) -> Option<TrapCode>", |f| {
+            f.add_block("match self", |f| {
+                for inst in insts {
+                    let Some(op) = inst.format.uses_memory() else { continue };
+                    let name = inst.name();
+                    match op.kind() {
+                        dsl::OperandKind::Mem(_) => {
+                            fmtln!(f, "Self::{name}(i) => i.{op}.trap_code(),");
+                        }
+                        dsl::OperandKind::RegMem(_) => {
+                            let ty = op.reg_class().unwrap();
+                            fmtln!(f, "Self::{name}(i) => match &i.{op} {{ {ty}Mem::Mem(mem) => mem.trap_code(), _ => None }},");
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                fmtln!(f, "_ => None,");
+            });
+        });
     });
 }
 

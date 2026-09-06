@@ -3572,6 +3572,13 @@ impl MachInstEmit for Inst {
             &Inst::SequencePoint { .. } => {
                 // Nothing.
             }
+            Inst::NixeBoundary { data } => {
+                data.record(sink, state.frame_layout(), 4);
+                if data.exit {
+                    // Unpublished exit. Its owner installs b imm26.
+                    sink.put4(0xd4200000); // brk #0
+                }
+            }
 
             &Inst::StackProbeLoop { start, end, step } => {
                 assert!(emit_info.flags.enable_probestack());
