@@ -587,6 +587,9 @@ where
     /// Find the best simplification of the given skeleton instruction, if any,
     /// by consulting our `simplify_skeleton` ISLE rules.
     fn simplify_skeleton_inst(&mut self, inst: Inst) -> Option<SkeletonInstSimplification> {
+        if crate::inst_predicates::has_observable_fp_effect(self.func, inst) {
+            return None;
+        }
         // NB: we support simplifying branch terminators (e.g. `brif` with a
         // constant condition into `jump`). This can make blocks unreachable,
         // but a separate `eliminate_unreachable_code` pass handles removing

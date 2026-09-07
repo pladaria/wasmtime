@@ -1315,6 +1315,9 @@
 (decl pure use_fma () bool)
 (extern constructor use_fma use_fma)
 
+(decl pure nixe_observable_fp () bool)
+(extern constructor nixe_observable_fp nixe_observable_fp)
+
 (decl pure use_avx_vnni () bool)
 (extern constructor use_avx_vnni use_avx_vnni)
 

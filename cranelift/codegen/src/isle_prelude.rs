@@ -1155,10 +1155,5 @@ macro_rules! isle_common_prelude_methods {
         fn f128_copysign(&mut self, a: Ieee128, b: Ieee128) -> Ieee128 {
             a.copysign(b)
         }
-
-        #[inline]
-        fn def_inst(&mut self, val: Value) -> Option<Inst> {
-            self.dfg().value_def(val).inst()
-        }
     };
 }

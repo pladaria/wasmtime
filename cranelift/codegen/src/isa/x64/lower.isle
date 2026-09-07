@@ -3739,7 +3739,19 @@
         (low32_as_float Xmm (x64_por low32 float_1p52))
         (high32 Xmm (x64_psrlq val (xmi_imm 32)))
         (high32_as_float Xmm (x64_por high32 float_1p84)))
-    (x64_addpd low32_as_float (x64_subpd high32_as_float float_1p84_plus_1p52))))
+    (unsigned_f64x2_result
+      (x64_addpd low32_as_float (x64_subpd high32_as_float float_1p84_plus_1p52)))))
+
+;; Bias-removal sequences below are exact until their final rounding, but an
+;; exact cancellation produces -0 under round-toward-negative. Unsigned
+;; integer conversions must produce +0. All other results are nonnegative;
+;; clearing their sign leaves rounding and status intact and avoids scalarizing
+;; the conversion. Ordinary CLIF uses nearest-even and needs no correction.
+(decl unsigned_f64x2_result (Xmm) Xmm)
+(rule 1 (unsigned_f64x2_result result)
+      (if-let true (nixe_observable_fp))
+      (x64_pand result (emit_xmm_mem_128_le_const 0x7fffffffffffffff_7fffffffffffffff)))
+(rule 0 (unsigned_f64x2_result result) result)
 
 ;; Algorithm uses unpcklps to help create a float that is equivalent
 ;; 0x1.0p52 + double(src). 0x1.0p52 is unique because at this exponent
@@ -3749,7 +3761,7 @@
       (let ((uint_mask XmmMem128 (emit_xmm_mem_128_le_const 0x43300000_43300000))
             (res Xmm (x64_unpcklps val uint_mask))
             (uint_mask_high XmmMem128 (emit_xmm_mem_128_le_const 0x4330000000000000_4330000000000000)))
-        (x64_subpd res uint_mask_high)))
+        (unsigned_f64x2_result (x64_subpd res uint_mask_high))))
 
 ;; When AVX512VL and AVX512F are available,
 ;; `fcvt_from_uint` can be lowered to a single instruction.

@@ -201,6 +201,17 @@ pub struct FunctionStencil {
     /// call instructions.
     pub debug_tags: DebugTags,
 
+    /// Preserve native floating-point environment effects for Nixe lowering.
+    /// FP arithmetic, comparisons, rounding and conversions execute in source
+    /// order relative to other effects, even when their results are unused.
+    /// They are opaque to value rewrites: the caller owns the dynamic host FP
+    /// control/status environment, rather than CLIF's default FP assumptions.
+    /// This does not make backend expansions implement guest FP semantics;
+    /// the frontend must still guard their supported operand/control domain.
+    /// Bitwise FP operations (negation, absolute value, copysign) remain pure.
+    /// Set before optimization. Independent of the leaf calling convention.
+    pub nixe_observable_fp: bool,
+
     /// Nixe canonical external entries, in caller order. Set with
     /// `nixe::set_entries`; the layout's first block is then analysis-only.
     /// Entries have no block parameters and define their own live inputs.
@@ -231,6 +242,7 @@ impl FunctionStencil {
         self.layout.clear();
         self.srclocs.clear();
         self.debug_tags.clear();
+        self.nixe_observable_fp = false;
         self.nixe_entries.clear();
         self.nixe_entry_constraints.clear();
         self.stack_limit = None;
@@ -434,6 +446,7 @@ impl Function {
                 srclocs: SecondaryMap::new(),
                 stack_limit: None,
                 debug_tags: DebugTags::default(),
+                nixe_observable_fp: false,
                 nixe_entries: alloc::vec::Vec::new(),
                 nixe_entry_constraints: alloc::collections::BTreeMap::new(),
             },

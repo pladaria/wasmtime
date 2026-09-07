@@ -1259,6 +1259,11 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         self.value_lowered_uses[self.f.dfg.inst_results(inst)[index]] != 0
     }
 
+    /// Whether the caller owns a dynamically controlled, observable FP environment.
+    pub(crate) fn nixe_observable_fp(&self) -> bool {
+        self.f.nixe_observable_fp
+    }
+
     pub fn block_successor_label(&self, block: Block, succ: usize) -> MachLabel {
         trace!("block_successor_label: block {block} succ {succ}");
         let lowered = self
@@ -1409,6 +1414,17 @@ fn is_value_use_root(f: &Function, inst: Inst) -> bool {
 impl<'func, I: VCodeInst> Lower<'func, I> {
     pub fn dfg(&self) -> &DataFlowGraph {
         &self.f.dfg
+    }
+
+    /// The ordinary ISLE Value -> Inst extractor does not use the sinking
+    /// query. Keep observable FP opaque there as well, so consumer patterns
+    /// cannot introduce additional FP effects while the producer stays live.
+    pub(crate) fn value_def_for_pattern(&self, value: Value) -> Option<Inst> {
+        self.f
+            .dfg
+            .value_def(value)
+            .inst()
+            .filter(|&inst| !crate::inst_predicates::has_observable_fp_effect(self.f, inst))
     }
 
     /// Get the `Callee`.
@@ -1609,7 +1625,13 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
                 let src_side_effect = src_entry_color.get() != 0;
                 trace!(" -> src inst {}", self.f.dfg.display_inst(src_inst));
                 trace!(" -> has lowering side effect: {}", src_side_effect);
-                if is_value_use_root(self.f, src_inst) {
+                if crate::inst_predicates::has_observable_fp_effect(self.f, src_inst) {
+                    // Do not absorb FP operations into consumer patterns even
+                    // when adjacent. Those patterns assume only value semantics
+                    // (e.g. compare/select -> min); status must happen exactly
+                    // once with the original operation and control environment.
+                    InputSourceInst::None
+                } else if is_value_use_root(self.f, src_inst) {
                     // If this instruction is a "root instruction" then it's
                     // required that we can't look through it to see the
                     // definition. This means that the `ValueUseState` for the

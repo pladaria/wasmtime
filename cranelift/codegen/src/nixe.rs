@@ -138,6 +138,9 @@ mod boundary_tests;
 #[cfg(all(test, feature = "x86", feature = "arm64"))]
 mod chaining_tests;
 
+#[cfg(all(test, feature = "x86", feature = "arm64", feature = "disas"))]
+mod fp_effects_tests;
+
 pub(crate) fn validate(func: &ir::Function, isa: &dyn TargetIsa) -> CodegenResult<()> {
     if isa.flags().enable_nixe_ibt() && (!isa.flags().enable_nixe_abi() || isa.name() != "x64") {
         return Err(CodegenError::Unsupported(

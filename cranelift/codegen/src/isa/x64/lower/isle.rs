@@ -518,6 +518,10 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
         self.backend.x64_flags.has_avx() && self.backend.x64_flags.has_fma()
     }
 
+    fn nixe_observable_fp(&mut self) -> bool {
+        self.lower_ctx.nixe_observable_fp()
+    }
+
     fn use_avx_vnni(&mut self) -> bool {
         self.backend.x64_flags.has_avx() && self.backend.x64_flags.has_avx_vnni()
     }

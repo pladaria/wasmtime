@@ -72,6 +72,11 @@ pub trait FuncWriter {
             )?;
         }
 
+        if func.nixe_observable_fp {
+            any = true;
+            writeln!(w, "    nixe_observable_fp")?;
+        }
+
         for (id, constraints) in &func.nixe_entry_constraints {
             any = true;
             write!(w, "    nixe_inputs {id} = [")?;

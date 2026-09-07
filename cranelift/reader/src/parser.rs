@@ -1471,6 +1471,14 @@ impl<'a> Parser<'a> {
     fn parse_preamble(&mut self, ctx: &mut Context) -> ParseResult<()> {
         loop {
             match self.token() {
+                Some(Token::Identifier("nixe_observable_fp")) => {
+                    if ctx.function.nixe_observable_fp {
+                        return err!(self.loc, "duplicate Nixe FP environment declaration");
+                    }
+                    self.consume();
+                    ctx.function.nixe_observable_fp = true;
+                    Ok(())
+                }
                 Some(Token::Identifier("nixe_inputs")) => {
                     use cranelift_codegen::nixe::EntryConstraint;
                     self.consume();
@@ -3848,6 +3856,22 @@ mod tests {
                 "{declarations}"
             );
         }
+    }
+
+    #[test]
+    fn parse_nixe_observable_fp_roundtrip() {
+        for observable in [false, true] {
+            let declaration = if observable { "nixe_observable_fp" } else { "" };
+            let code = format!("function %test() {{\n{declaration}\nblock0:\n return\n}}");
+            let func = Parser::new(&code).parse_function().unwrap().0;
+            assert_eq!(func.nixe_observable_fp, observable);
+            let printed = func.display().to_string();
+            let reparsed = Parser::new(&printed).parse_function().unwrap().0;
+            assert_eq!(reparsed.nixe_observable_fp, observable);
+            assert_eq!(printed, reparsed.display().to_string());
+        }
+        let duplicate = "function %test() { nixe_observable_fp nixe_observable_fp block0: return }";
+        assert!(Parser::new(duplicate).parse_function().is_err());
     }
 
     #[test]

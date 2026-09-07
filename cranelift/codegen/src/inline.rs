@@ -358,6 +358,12 @@ fn inline_one(
     let expected_callee_sig = &func.dfg.signatures[expected_callee_sig];
     assert_eq!(expected_callee_sig, &callee.signature);
 
+    if func.nixe_observable_fp != callee.nixe_observable_fp {
+        return Err(crate::CodegenError::Unsupported(
+            "cannot inline functions with different Nixe FP environment contracts".into(),
+        ));
+    }
+
     allocs.reset(callee);
 
     // First, append various callee entity arenas to the end of the caller's
