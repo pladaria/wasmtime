@@ -316,6 +316,7 @@
        ;; A pseudoinstruction that serves as a sequence point.
        (SequencePoint)
        (NixeEndbr64)
+       (NixeArenaAddr (offset Gpr) (dst WritableGpr))
        (NixeBoundary (data BoxNixeBoundary))
 
        ;; An instruction assembled outside of cranelift-codegen.

@@ -111,6 +111,7 @@ impl Inst {
             | Inst::LabelAddress { .. }
             | Inst::SequencePoint
             | Inst::NixeEndbr64
+            | Inst::NixeArenaAddr { .. }
             | Inst::NixeBoundary { .. } => true,
 
             Inst::Atomic128RmwSeq { .. } | Inst::Atomic128XchgSeq { .. } => emit_info.cmpxchg16b(),
@@ -843,6 +844,7 @@ impl PrettyPrint for Inst {
                 format!("sequence_point")
             }
             Inst::NixeBoundary { data } => format!("nixe_boundary {data:?}"),
+            Inst::NixeArenaAddr { offset, dst } => format!("nixe_arena_addr {offset:?}, {dst:?}"),
             Inst::NixeEndbr64 => format!("endbr64"),
 
             Inst::External { inst } => {
@@ -1221,6 +1223,11 @@ fn x64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
 
         Inst::SequencePoint { .. } | Inst::NixeEndbr64 => {}
         Inst::NixeBoundary { data } => data.operands(collector),
+        Inst::NixeArenaAddr { offset, dst } => {
+            collector.reg_use(offset);
+            collector.reg_def(dst);
+            collector.reg_fixed_nonallocatable(regs::r13().to_real_reg().unwrap().into());
+        }
 
         Inst::External { inst } => {
             inst.visit(&mut external::RegallocVisitor { collector });
@@ -1486,7 +1493,9 @@ impl MachInst for Inst {
     }
 
     fn worst_case_size() -> CodeOffset {
-        15
+        // A checked Nixe terminal is a compound instruction: up to seven
+        // alignment bytes, SUB/JLE (9), and two eight-byte exit patches.
+        32
     }
 
     fn gen_block_start(indirect: bool, cfi: bool) -> Option<Self> {

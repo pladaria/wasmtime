@@ -185,6 +185,7 @@ impl Context {
         self.verify_if(isa)?;
 
         crate::nixe::validate_entries(&self.func, isa)?;
+        crate::nixe::validate_exit_costs(&self.func)?;
         self.compute_cfg();
         self.compute_domtree();
         self.eliminate_unreachable_code(isa)?;

@@ -4579,6 +4579,11 @@
 (rule (lower (get_pinned_reg _))
       (read_pinned_gpr))
 
+(rule (lower (nixe_arena_addr _ offset))
+      (let ((dst WritableGpr (temp_writable_gpr))
+            (_ Unit (emit (MInst.NixeArenaAddr offset dst))))
+        (output_reg dst)))
+
 ;; Rules for `set_pinned_reg` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (rule (lower (set_pinned_reg a @ (value_type ty)))

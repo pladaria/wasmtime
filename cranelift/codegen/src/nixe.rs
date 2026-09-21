@@ -9,12 +9,21 @@
 //! bridges from these contracts. A marker map does not describe a later fault;
 //! `nixe_fault_start`/`nixe_fault_end` attach exact prefault maps to the ordinary
 //! memory lowering. The production gateway remains owner-provided.
+//!
+//! `Function::nixe_exit_costs` optionally charges r14/x20 at an allocation-visible
+//! terminal and selects a cold patch for a signed nonpositive balance. The hot
+//! path is one subtraction, one normally-not-taken conditional branch and the
+//! owner's direct branch. Both patches preserve mapped SSA values, NOT implicit
+//! host condition flags. The owner must patch both, never charge again on cold
+//! entry, and resume at the hot patch after rearming rather than replaying work.
+//! `nixe_charge` subtracts a completed block's cost without checking the deadline
+//! or changing flags. A zero-cost terminal can check this already-charged work.
 
 use crate::{CodegenError, CodegenResult, ir, isa::TargetIsa};
 use alloc::format;
 
 mod boundary;
-pub use boundary::{Boundary, EntryConstraint, LocatedValue, Location, StateMap};
+pub use boundary::{Boundary, EntryConstraint, LocatedValue, Location, PollCheckpoint, StateMap};
 
 /// Bytes reserved for boundary transfers; never allocated to backend spills.
 pub const TRANSFER_BYTES: u32 = 2048;
@@ -141,6 +150,36 @@ mod chaining_tests;
 #[cfg(all(test, feature = "x86", feature = "arm64", feature = "disas"))]
 mod fp_effects_tests;
 
+/// Validate caller-supplied costs before optimizations can remove dead exits.
+pub(crate) fn validate_exit_costs(func: &ir::Function) -> CodegenResult<()> {
+    if func.nixe_exit_costs.is_empty() {
+        return Ok(());
+    }
+    let ids: alloc::collections::BTreeSet<_> = func
+        .layout
+        .blocks()
+        .flat_map(|block| func.layout.block_insts(block))
+        .filter_map(|inst| match func.dfg.insts[inst] {
+            ir::InstructionData::NixeBoundary {
+                opcode: ir::Opcode::NixeExit,
+                imm,
+                ..
+            } => Some(imm.bits() as u64),
+            _ => None,
+        })
+        .collect();
+    if func
+        .nixe_exit_costs
+        .iter()
+        .any(|(id, cost)| !ids.contains(id) || *cost > 2048)
+    {
+        return Err(CodegenError::Unsupported(
+            "Nixe checkpoint requires an exit ID and cost in 0..=2048".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate(func: &ir::Function, isa: &dyn TargetIsa) -> CodegenResult<()> {
     if isa.flags().enable_nixe_ibt() && (!isa.flags().enable_nixe_abi() || isa.name() != "x64") {
         return Err(CodegenError::Unsupported(
@@ -150,17 +189,41 @@ pub(crate) fn validate(func: &ir::Function, isa: &dyn TargetIsa) -> CodegenResul
     validate_entries(func, isa)?;
     let mut boundary_ids = alloc::collections::BTreeSet::new();
     let mut entry_ids = alloc::collections::BTreeSet::new();
+    let mut exit_ids = alloc::collections::BTreeSet::new();
     for block in func.layout.blocks() {
         let mut fault_span = None;
         let mut fault_has_memory = false;
         for inst in func.layout.block_insts(block) {
             let op = func.dfg.insts[inst].opcode();
+            if let ir::InstructionData::UnaryImm {
+                opcode: ir::Opcode::NixeCharge,
+                imm,
+            } = func.dfg.insts[inst]
+            {
+                if !isa.flags().enable_nixe_abi()
+                    || !(1..=2048).contains(&imm.bits())
+                    || fault_span.is_some()
+                {
+                    return Err(CodegenError::Unsupported(
+                        "Nixe charge requires Nixe ABI, cost in 1..=2048 and no active fault span"
+                            .into(),
+                    ));
+                }
+            }
+            if op == ir::Opcode::NixeArenaAddr && !isa.flags().enable_nixe_abi() {
+                return Err(CodegenError::Unsupported(
+                    "Nixe arena address requires the Nixe ABI".into(),
+                ));
+            }
             if fault_span.is_some() && (op.is_terminator() || op.is_call()) {
                 return Err(CodegenError::Unsupported(
                     "Nixe fault span cannot cross control flow".into(),
                 ));
             }
             if let ir::InstructionData::NixeBoundary { imm, .. } = func.dfg.insts[inst] {
+                if op == ir::Opcode::NixeExit {
+                    exit_ids.insert(imm.bits() as u64);
+                }
                 if op == ir::Opcode::NixeFaultEnd {
                     if fault_span.take() != Some(imm.bits()) || !func.dfg.inst_args(inst).is_empty()
                     {
@@ -294,6 +357,15 @@ pub(crate) fn validate(func: &ir::Function, isa: &dyn TargetIsa) -> CodegenResul
     {
         return Err(CodegenError::Unsupported(
             "Nixe entry constraints name a missing entry ID".into(),
+        ));
+    }
+    if func
+        .nixe_exit_costs
+        .iter()
+        .any(|(id, cost)| !exit_ids.contains(id) || *cost > 2048)
+    {
+        return Err(CodegenError::Unsupported(
+            "Nixe checkpoint requires an exit ID and cost in 0..=2048".into(),
         ));
     }
     if !isa.flags().enable_nixe_abi() {

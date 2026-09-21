@@ -6,6 +6,511 @@ use alloc::vec::Vec;
 
 const COUNT: usize = 40;
 
+#[cfg(feature = "disas")]
+#[test]
+fn guest_fault_delimiters_prevent_cross_access_forwarding_without_hardware_fences() {
+    for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        let isa = target(triple, "backtracking", true);
+        for mode in 0..4 {
+            for delimited in [false, true] {
+                let mut f = ir::Function::new();
+                let block = f.dfg.make_block();
+                f.layout.append_block(block);
+                let mut c = FuncCursor::new(&mut f).at_bottom(block);
+                let address = c.ins().get_pinned_reg(types::I64);
+                let one = c.ins().iconst(types::I64, 1);
+                let two = c.ins().iconst(types::I64, 2);
+                let flags = MemFlagsData::new();
+                let mut results = Vec::new();
+                for id in 1..=2 {
+                    if delimited {
+                        c.ins().nixe_fault_start(id, &[address]);
+                    }
+                    if mode == 0 || mode == 1 && id == 2 {
+                        results.push(c.ins().load(types::I64, flags, address, 0));
+                    } else {
+                        let value = if mode == 3 && id == 2 { two } else { one };
+                        c.ins().store(flags, value, address, 0);
+                    }
+                    if delimited {
+                        c.ins().nixe_fault_end(id, &[]);
+                    }
+                }
+                c.ins().nixe_exit(3, &results);
+                let mut context = crate::Context::for_function(f);
+                context
+                    .compile(&*isa, &mut crate::control::ControlPlane::default())
+                    .unwrap();
+                let code = context.compiled_code().unwrap();
+                assert_eq!(code.buffer.nixe_faults.len(), if delimited { 2 } else { 0 });
+                let loads = context
+                    .func
+                    .layout
+                    .blocks()
+                    .flat_map(|block| context.func.layout.block_insts(block))
+                    .filter(|&inst| context.func.dfg.insts[inst].opcode() == ir::Opcode::Load)
+                    .count();
+                if mode == 0 {
+                    assert_eq!(loads, if delimited { 2 } else { 1 });
+                } else if mode == 1 {
+                    assert_eq!(loads, usize::from(delimited));
+                }
+                for (index, map) in code.buffer.nixe_faults.iter().enumerate() {
+                    assert_eq!(map.id, index as u64 + 1);
+                    assert!(map.fault_bytes > 0);
+                }
+                let decoder = isa.to_capstone().unwrap();
+                let disassembly = decoder.disasm_all(code.code_buffer(), 0).unwrap();
+                assert!(
+                    disassembly
+                        .iter()
+                        .all(|inst| !matches!(inst.mnemonic(), Some("mfence" | "dmb" | "dsb")))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn constant_branch_removes_dead_checkpoint_costs_without_hiding_invalid_input() {
+    for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        let isa = target(triple, "backtracking", true);
+        let mut f = ir::Function::new();
+        let entry = f.dfg.make_block();
+        let live = f.dfg.make_block();
+        let dead = f.dfg.make_block();
+        for block in [entry, live, dead] {
+            f.layout.append_block(block);
+        }
+        let mut cursor = FuncCursor::new(&mut f);
+        cursor.goto_bottom(entry);
+        let condition = cursor.ins().iconst(types::I8, 1);
+        cursor.ins().brif(condition, live, &[], dead, &[]);
+        cursor.goto_bottom(live);
+        cursor.ins().nixe_exit(1, &[]);
+        cursor.goto_bottom(dead);
+        cursor.ins().nixe_exit(2, &[]);
+        f.nixe_exit_costs.insert(1, 7);
+        f.nixe_exit_costs.insert(2, 13);
+        let mut context = crate::Context::for_function(f.clone());
+        context
+            .compile(&*isa, &mut crate::control::ControlPlane::default())
+            .unwrap();
+        assert_eq!(context.func.nixe_exit_costs.len(), 1);
+        assert_eq!(context.func.nixe_exit_costs.get(&1), Some(&7));
+        let maps = &context.compiled_code().unwrap().buffer.nixe_states;
+        assert_eq!(maps.len(), 1);
+        assert_eq!(maps[0].id, 1);
+        assert_eq!(maps[0].poll.unwrap().completed, 7);
+
+        // Invalid costs must fail even if the corresponding exit would die.
+        f.nixe_exit_costs.insert(2, 2049);
+        assert!(compile(f, &*isa).unwrap_err().contains("Nixe checkpoint"));
+    }
+}
+
+#[test]
+fn internal_checks_export_cold_patch_and_keep_the_ssa_continuation() {
+    for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        for allocator in ["single_pass", "backtracking"] {
+            let isa = target(triple, allocator, true);
+            let mut f = fast_fragment();
+            let exit = f.layout.last_inst(f.layout.entry_block().unwrap()).unwrap();
+            let args = f.dfg.inst_args(exit).to_vec();
+            FuncCursor::new(&mut f)
+                .at_inst(exit)
+                .ins()
+                .nixe_check(77, &args);
+            let code = compile(f, &*isa).unwrap();
+            let map = code
+                .buffer
+                .nixe_states
+                .iter()
+                .find(|map| map.id == 77)
+                .unwrap();
+            let terminal = code
+                .buffer
+                .nixe_states
+                .iter()
+                .find(|map| map.id == 2)
+                .unwrap();
+            assert!(!map.entry && map.poll.is_none());
+            assert_eq!(map.values.len(), args.len());
+            assert!(map.values.iter().all(|v| v.location != Location::Unused));
+            assert!(map.offset + u32::from(map.patch_bytes) <= terminal.offset);
+            let expected = if triple.starts_with("x86") {
+                vec![0x4d, 0x85, 0xf6, 0x7f, 8]
+            } else {
+                [0xf100029f_u32, 0x5400004c]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect()
+            };
+            assert_eq!(
+                &code.code_buffer()[map.offset as usize - expected.len()..map.offset as usize],
+                expected
+            );
+            let mut bytes = code.code_buffer().to_vec();
+            map.patch_exit(
+                &mut bytes,
+                0,
+                u64::from(map.offset + u32::from(map.patch_bytes)),
+            )
+            .unwrap();
+        }
+    }
+}
+
+#[test]
+fn block_charges_preserve_flags_and_do_not_export_boundaries() {
+    for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        for allocator in ["single_pass", "backtracking"] {
+            let isa = target(triple, allocator, true);
+            for cost in [1_i64, 2048] {
+                let mut f = fast_fragment();
+                let block = f.layout.entry_block().unwrap();
+                let exit = f.layout.last_inst(block).unwrap();
+                let mut c = FuncCursor::new(&mut f).at_inst(exit);
+                c.ins().nixe_charge(cost);
+                c.ins().nixe_charge(cost); // costs are not unique boundary IDs
+                let code = compile(f, &*isa).unwrap();
+                let bytes = if triple.starts_with("x86") {
+                    [0x4d, 0x8d, 0xb6]
+                        .into_iter()
+                        .chain((-(cost as i32)).to_le_bytes())
+                        .collect::<Vec<_>>()
+                } else {
+                    (0xd1000294 | ((cost as u32) << 10)).to_le_bytes().to_vec()
+                };
+                assert_eq!(
+                    code.code_buffer()
+                        .windows(bytes.len())
+                        .filter(|w| *w == bytes)
+                        .count(),
+                    2
+                );
+                assert!(
+                    code.buffer
+                        .nixe_states
+                        .iter()
+                        .all(|map| map.id == 1 || map.id == 2)
+                );
+            }
+            for cost in [-1_i64, 0, 2049, 65537] {
+                let mut f = fast_fragment();
+                let exit = f.layout.last_inst(f.layout.entry_block().unwrap()).unwrap();
+                FuncCursor::new(&mut f)
+                    .at_inst(exit)
+                    .ins()
+                    .nixe_charge(cost);
+                assert!(compile(f, &*isa).unwrap_err().contains("Nixe charge"));
+            }
+            let mut f = fast_fragment();
+            let exit = f.layout.last_inst(f.layout.entry_block().unwrap()).unwrap();
+            let mut c = FuncCursor::new(&mut f).at_inst(exit);
+            c.ins().nixe_fault_start(3, &[]);
+            c.ins().nixe_charge(1);
+            c.ins().nixe_fault_end(3, &[]);
+            assert!(compile(f, &*isa).unwrap_err().contains("Nixe charge"));
+
+            // Isolate the charge: no other Nixe opcode can cause rejection.
+            let mut f = ir::Function::new();
+            let block = f.dfg.make_block();
+            f.layout.append_block(block);
+            let mut c = FuncCursor::new(&mut f).at_bottom(block);
+            c.ins().nixe_charge(1);
+            c.ins().return_(&[]);
+            assert!(
+                compile(f, &*target(triple, allocator, false))
+                    .unwrap_err()
+                    .contains("Nixe charge")
+            );
+        }
+    }
+}
+
+#[test]
+fn checked_terminals_keep_allocated_operands_and_export_both_patches() {
+    for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        for allocator in ["single_pass", "backtracking"] {
+            let isa = target(triple, allocator, true);
+            for cost in [0, 1, 512, 2048] {
+                let mut f = fast_fragment();
+                f.nixe_exit_costs.insert(2, cost);
+                let code = compile(f, &*isa).unwrap();
+                let map = code
+                    .buffer
+                    .nixe_states
+                    .iter()
+                    .find(|map| map.id == 2)
+                    .unwrap();
+                let poll = map.poll.unwrap();
+                assert_eq!(poll.completed, cost);
+                assert_eq!(poll.offset, map.offset + u32::from(map.patch_bytes));
+                assert_eq!(map.values.len(), COUNT * 2);
+                assert!(
+                    map.values
+                        .iter()
+                        .any(|value| matches!(value.location, Location::Spill { .. }))
+                );
+                assert!(
+                    map.values
+                        .iter()
+                        .all(|value| value.location != Location::Unused)
+                );
+                let end = map.offset as usize;
+                let expected: Vec<u8> = if map.patch_bytes == 8 {
+                    [0x49, 0x81, 0xee]
+                        .into_iter()
+                        .chain(u32::from(cost).to_le_bytes())
+                        .chain([0x7e, 8])
+                        .collect()
+                } else {
+                    [0xf1000294 | (u32::from(cost) << 10), 0x5400004d]
+                        .into_iter()
+                        .flat_map(u32::to_le_bytes)
+                        .collect()
+                };
+                assert_eq!(&code.code_buffer()[end - expected.len()..end], expected);
+                let mut bytes = code.code_buffer().to_vec();
+                map.patch_exit(&mut bytes, 0, 0).unwrap();
+                map.patch_poll(&mut bytes, 0, 0).unwrap();
+                assert_ne!(
+                    &bytes[end..end + map.patch_bytes as usize],
+                    &bytes[poll.offset as usize..poll.offset as usize + map.patch_bytes as usize]
+                );
+                assert!(
+                    map.patch_poll(&mut bytes[..poll.offset as usize], 0, 8)
+                        .is_err()
+                );
+            }
+            for (id, cost) in [(1, 1), (3, 1), (2, 2049)] {
+                let mut f = fast_fragment();
+                f.nixe_exit_costs.insert(id, cost);
+                assert!(compile(f, &*isa).unwrap_err().contains("Nixe checkpoint"));
+            }
+        }
+    }
+    let mut f = fast_fragment();
+    f.nixe_exit_costs.insert(2, 1);
+    f.clear();
+    assert!(f.nixe_exit_costs.is_empty());
+}
+
+#[cfg(feature = "disas")]
+#[test]
+fn cas128_maps_preserve_pre_values_through_lse_and_validating_pair_loop() {
+    use crate::settings::Configurable;
+    for allocator in ["single_pass", "backtracking"] {
+        for lse in [false, true] {
+            let base = target("aarch64-unknown-linux-gnu", allocator, true);
+            let mut builder = crate::isa::lookup(base.triple().clone()).unwrap();
+            builder
+                .set("has_lse", if lse { "true" } else { "false" })
+                .unwrap();
+            let isa = builder.finish(base.flags().clone()).unwrap();
+            let mut f = ir::Function::new();
+            let block = f.dfg.make_block();
+            f.layout.append_block(block);
+            let mut c = FuncCursor::new(&mut f).at_bottom(block);
+            let address = c.ins().get_pinned_reg(types::I64);
+            let values: Vec<_> = (0..COUNT)
+                .map(|i| c.ins().iadd_imm_u(address, i as i64))
+                .collect();
+            let expected = c.ins().iconcat(values[1], values[2]);
+            let replacement = c.ins().iconcat(values[3], values[4]);
+            c.ins().nixe_fault_start(1, &values);
+            let old = c
+                .ins()
+                .atomic_cas(MemFlagsData::new(), address, expected, replacement);
+            c.ins().nixe_fault_end(1, &[]);
+            let (lo, hi) = c.ins().isplit(old);
+            let mut out = values.clone();
+            out.extend([lo, hi]);
+            c.ins().nixe_exit(2, &out);
+            let code = compile(f, &*isa).unwrap();
+            assert_eq!(code.buffer.nixe_faults.len(), if lse { 1 } else { 3 });
+            let decoder = isa.to_capstone().unwrap();
+            let decoded = decoder.disasm_all(code.code_buffer(), 0).unwrap();
+            for (i, map) in code.buffer.nixe_faults.iter().enumerate() {
+                assert_eq!(map.id, 1);
+                assert_eq!(map.fault_bytes, 4);
+                assert_eq!(map.values.len(), COUNT);
+                for value in &map.values {
+                    assert!(
+                        !matches!(value.location, Location::Register { index, vector: false }
+                        if matches!(index, 0 | 1) || (!lse && index == 7))
+                    );
+                }
+                let inst = decoded
+                    .iter()
+                    .find(|inst| inst.address() == u64::from(map.offset))
+                    .unwrap();
+                assert_eq!(
+                    inst.mnemonic(),
+                    Some(if lse {
+                        "caspal"
+                    } else if i == 0 {
+                        "ldaxp"
+                    } else {
+                        "stlxp"
+                    })
+                );
+                if !lse && i == 2 {
+                    assert_eq!(inst.op_str(), Some("w7, x0, x1, [x6]"));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "disas")]
+#[test]
+fn nixe_rmw_unsigned_loop_masks_narrow_operands_and_lse_swap_is_direct() {
+    use crate::settings::Configurable;
+    for allocator in ["single_pass", "backtracking"] {
+        for lse in [false, true] {
+            let base = target("aarch64-unknown-linux-gnu", allocator, true);
+            let mut builder = crate::isa::lookup(base.triple().clone()).unwrap();
+            builder
+                .set("has_lse", if lse { "true" } else { "false" })
+                .unwrap();
+            let isa = builder.finish(base.flags().clone()).unwrap();
+            for ty in [types::I8, types::I16, types::I32, types::I64] {
+                for op in [
+                    ir::AtomicRmwOp::Umin,
+                    ir::AtomicRmwOp::Umax,
+                    ir::AtomicRmwOp::Xchg,
+                ] {
+                    let mut f = ir::Function::new();
+                    let block = f.dfg.make_block();
+                    f.layout.append_block(block);
+                    let mut c = FuncCursor::new(&mut f).at_bottom(block);
+                    let address = c.ins().get_pinned_reg(types::I64);
+                    let operand = if ty == types::I64 {
+                        address
+                    } else {
+                        c.ins().ireduce(ty, address)
+                    };
+                    c.ins().nixe_fault_start(1, &[address, operand]);
+                    let old = c
+                        .ins()
+                        .atomic_rmw(ty, MemFlagsData::new(), op, address, operand);
+                    c.ins().nixe_fault_end(1, &[]);
+                    c.ins().nixe_exit(2, &[old]);
+                    let code = compile(f, &*isa).unwrap();
+                    assert_eq!(code.buffer.nixe_faults.len(), if lse { 1 } else { 2 });
+                    let decoder = isa.to_capstone().unwrap();
+                    let instructions = decoder.disasm_all(code.code_buffer(), 0).unwrap();
+                    if lse && op == ir::AtomicRmwOp::Xchg {
+                        assert!(
+                            instructions
+                                .iter()
+                                .any(|i| i.mnemonic().unwrap().starts_with("swpal"))
+                        );
+                    } else if !lse && op != ir::AtomicRmwOp::Xchg && ty.bits() < 32 {
+                        let extension = if ty == types::I8 { "uxtb" } else { "uxth" };
+                        assert!(instructions.iter().any(|i| i.mnemonic() == Some("cmp")
+                            && i.op_str().unwrap().contains(extension)));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "disas")]
+#[test]
+fn nixe_cas_loop_has_fault_maps_for_both_conditional_stores() {
+    for allocator in ["single_pass", "backtracking"] {
+        let isa = target("aarch64-unknown-linux-gnu", allocator, true);
+        for ty in [types::I8, types::I16, types::I32, types::I64] {
+            let mut f = ir::Function::new();
+            let block = f.dfg.make_block();
+            f.layout.append_block(block);
+            let mut c = FuncCursor::new(&mut f).at_bottom(block);
+            let address = c.ins().get_pinned_reg(types::I64);
+            let expected = c.ins().iconst(ty, 3);
+            let replacement = c.ins().iconst(ty, 9);
+            c.ins()
+                .nixe_fault_start(1, &[address, expected, replacement]);
+            let old = c
+                .ins()
+                .atomic_cas(MemFlagsData::new(), address, expected, replacement);
+            c.ins().nixe_fault_end(1, &[]);
+            c.ins().nixe_exit(2, &[old]);
+            let code = compile(f, &*isa).unwrap();
+            assert_eq!(code.buffer.nixe_faults.len(), 3);
+            let decoder = isa.to_capstone().unwrap();
+            let instructions = decoder.disasm_all(code.code_buffer(), 0).unwrap();
+            for (index, map) in code.buffer.nixe_faults.iter().enumerate() {
+                assert_eq!(map.id, 1);
+                assert_eq!(map.fault_bytes, 4);
+                let inst = instructions
+                    .iter()
+                    .find(|i| i.address() == u64::from(map.offset))
+                    .unwrap();
+                assert!(inst.mnemonic().unwrap().starts_with(if index == 0 {
+                    "ldaxr"
+                } else {
+                    "stlxr"
+                }));
+                if index == 2 {
+                    assert!(inst.op_str().unwrap().contains(if ty == types::I64 {
+                        "x27"
+                    } else {
+                        "w27"
+                    }));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "disas")]
+#[test]
+fn arena_address_uses_one_flag_preserving_instruction_and_requires_nixe() {
+    for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        for allocator in ["single_pass", "backtracking"] {
+            let mut f = ir::Function::new();
+            let block = f.dfg.make_block();
+            f.layout.append_block(block);
+            let mut c = FuncCursor::new(&mut f).at_bottom(block);
+            let offset = c.ins().get_pinned_reg(types::I64);
+            let address = c.ins().nixe_arena_addr(offset);
+            c.ins().nixe_exit(1, &[address]);
+            let disabled = target(triple, allocator, false);
+            assert!(
+                compile(f.clone(), &*disabled)
+                    .unwrap_err()
+                    .contains("requires the Nixe ABI")
+            );
+            let isa = target(triple, allocator, true);
+            let code = compile(f, &*isa).unwrap();
+            let decoder = isa.to_capstone().unwrap();
+            let instructions = decoder.disasm_all(code.code_buffer(), 0).unwrap();
+            let arena = if triple.starts_with("x86") {
+                "r13"
+            } else {
+                "x19"
+            };
+            let uses: Vec<_> = instructions
+                .iter()
+                .filter(|inst| inst.op_str().unwrap_or("").contains(arena))
+                .collect();
+            assert_eq!(uses.len(), 1);
+            assert_eq!(
+                uses[0].mnemonic(),
+                Some(if triple.starts_with("x86") {
+                    "leaq"
+                } else {
+                    "add"
+                })
+            );
+        }
+    }
+}
+
 #[test]
 #[should_panic(expected = "Nixe memory trap was not given allocation-visible prefault operands")]
 fn nixe_fault_emission_rejects_missing_allocation_operands() {
@@ -79,6 +584,26 @@ fn nixe_fault_maps_follow_real_memory_pcs_on_both_targets() {
                     assert_eq!(map.values.len(), COUNT * 2);
                     assert!(!map.entry);
                     assert_eq!(map.patch_bytes, 0);
+                    if triple.starts_with("aarch64") {
+                        assert_eq!(map.fault_bytes, 4);
+                        assert_eq!(map.offset % 4, 0);
+                    } else {
+                        assert!((1..=15).contains(&map.fault_bytes));
+                    }
+                    #[cfg(feature = "disas")]
+                    {
+                        // Decode independently in tests only. In production the
+                        // emitter supplies the extent, including LOCK/prefixes.
+                        let decoder = isa.to_capstone().unwrap();
+                        let decoded = decoder
+                            .disasm_count(&code.code_buffer()[map.offset as usize..], 0, 1)
+                            .unwrap();
+                        assert_eq!(decoded.len(), 1);
+                        assert_eq!(
+                            decoded.iter().next().unwrap().bytes().len(),
+                            usize::from(map.fault_bytes)
+                        );
+                    }
                     assert!(
                         code.buffer
                             .traps()
@@ -143,6 +668,50 @@ fn nixe_fault_spans_reject_missing_pairs_and_unsafe_contents() {
             compile(f, &*isa).unwrap_err().contains(expected),
             "case {bad}"
         );
+    }
+}
+
+#[cfg(feature = "disas")]
+#[test]
+fn nixe_fault_extents_exclude_following_instructions_and_padding() {
+    for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        for allocator in ["single_pass", "backtracking"] {
+            let isa = target(triple, allocator, true);
+            for ty in [types::I8, types::I16, types::I32, types::I64, types::I8X16] {
+                for displacement in [0, 8, 8192] {
+                    let mut f = ir::Function::new();
+                    let block = f.dfg.make_block();
+                    f.layout.append_block(block);
+                    let mut c = FuncCursor::new(&mut f).at_bottom(block);
+                    let address = c.ins().get_pinned_reg(types::I64);
+                    c.ins().nixe_fault_start(1, &[address]);
+                    let loaded = c.ins().load(ty, MemFlagsData::new(), address, displacement);
+                    c.ins().nixe_fault_end(1, &[]);
+                    c.ins().nixe_fault_start(2, &[address, loaded]);
+                    c.ins()
+                        .store(MemFlagsData::new(), loaded, address, displacement + 16);
+                    c.ins().nixe_fault_end(2, &[]);
+                    c.ins().nixe_exit(3, &[loaded]);
+                    let code = compile(f, &*isa).unwrap();
+                    assert_eq!(code.buffer.nixe_faults.len(), 2);
+                    let decoder = isa.to_capstone().unwrap();
+                    for map in &code.buffer.nixe_faults {
+                        let instructions = decoder
+                            .disasm_count(&code.code_buffer()[map.offset as usize..], 0, 2)
+                            .unwrap();
+                        assert_eq!(instructions.len(), 2);
+                        let first = instructions.iter().next().unwrap();
+                        assert_eq!(
+                            usize::from(map.fault_bytes),
+                            first.bytes().len(),
+                            "{triple}/{allocator}/{ty}/{displacement}: {first}"
+                        );
+                    }
+                    let maps = &code.buffer.nixe_faults;
+                    assert!(maps[0].offset + u32::from(maps[0].fault_bytes) <= maps[1].offset);
+                }
+            }
+        }
     }
 }
 
@@ -220,6 +789,8 @@ fn nixe_exit_patch_range_alignment_and_direction() {
             offset: 8,
             entry: false,
             patch_bytes: bytes,
+            fault_bytes: 0,
+            poll: None,
             values: Vec::new(),
         };
         let base = 1u64 << 32;

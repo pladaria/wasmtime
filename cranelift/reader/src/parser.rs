@@ -1479,6 +1479,24 @@ impl<'a> Parser<'a> {
                     ctx.function.nixe_observable_fp = true;
                     Ok(())
                 }
+                Some(Token::Identifier("nixe_poll")) => {
+                    self.consume();
+                    let id: u64 = self.match_uimm64("expected Nixe exit ID")?.into();
+                    self.match_token(Token::Equal, "expected '=' after exit ID")?;
+                    let cost: u64 = self.match_uimm64("expected checkpoint cost")?.into();
+                    if cost > 2048 {
+                        return err!(self.loc, "Nixe checkpoint cost must be in 0..=2048");
+                    }
+                    if ctx
+                        .function
+                        .nixe_exit_costs
+                        .insert(id, cost as u16)
+                        .is_some()
+                    {
+                        return err!(self.loc, "duplicate Nixe checkpoint ID");
+                    }
+                    Ok(())
+                }
                 Some(Token::Identifier("nixe_inputs")) => {
                     use cranelift_codegen::nixe::EntryConstraint;
                     self.consume();
@@ -2729,6 +2747,12 @@ impl<'a> Parser<'a> {
                 opcode,
                 arg: self.match_value("expected SSA value operand")?,
             },
+            InstructionFormat::UnaryImm if opcode == Opcode::NixeCharge => {
+                InstructionData::UnaryImm {
+                    opcode,
+                    imm: self.match_imm64("expected completed block cost")?,
+                }
+            }
             InstructionFormat::UnaryImm => {
                 let msg = |bits| format!("expected immediate {bits}-bit integer operand");
                 let unsigned = match explicit_control_type {
@@ -3812,8 +3836,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_nixe_poll_checkpoints() {
+        let code = "function %test() {\n nixe_poll 3 = 512\n nixe_poll 4 = 0\nblock0:\n nixe_charge 512\n nixe_exit 3\nblock1:\n nixe_exit 4\n}";
+        let func = Parser::new(code).parse_function().unwrap().0;
+        assert_eq!(func.nixe_exit_costs[&3], 512);
+        assert_eq!(func.nixe_exit_costs[&4], 0);
+        let printed = func.display().to_string();
+        let reparsed = Parser::new(&printed).parse_function().unwrap().0;
+        assert_eq!(func.nixe_exit_costs, reparsed.nixe_exit_costs);
+        for declarations in ["nixe_poll 3 = 2049", "nixe_poll 3 = 1\n nixe_poll 3 = 2"] {
+            let code = format!("function %test() {{\n{declarations}\nblock0:\n nixe_exit 3\n}}");
+            assert!(Parser::new(&code).parse_function().is_err());
+        }
+    }
+
+    #[test]
     fn parse_nixe_boundaries_roundtrip() {
-        let code = "function %test() {\n    nixe_inputs 1 = [integer 2, vector 7]\n    sig0 = () -> i64, i8x16\nblock0:\n    v0, v1 = nixe_entry sig0, 1\n    nixe_state 2, v0, v1\n    nixe_fault_start 4, v0, v1\n    v2 = load.i64 v0\n    nixe_fault_end 4\n    nixe_exit 3, v2, v1\n}";
+        let code = "function %test() {\n    nixe_inputs 1 = [integer 2, vector 7]\n    sig0 = () -> i64, i8x16\nblock0:\n    v0, v1 = nixe_entry sig0, 1\n    nixe_state 2, v0, v1\n    nixe_check 5, v0, v1\n    nixe_fault_start 4, v0, v1\n    v2 = load.i64 v0\n    nixe_fault_end 4\n    nixe_exit 3, v2, v1\n}";
         let func = Parser::new(code).parse_function().unwrap().0;
         let printed = func.display().to_string();
         let reparsed = Parser::new(&printed).parse_function().unwrap().0;

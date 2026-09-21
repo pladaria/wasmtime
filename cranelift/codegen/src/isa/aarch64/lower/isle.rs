@@ -37,6 +37,7 @@ use core::u32;
 use regalloc2::PReg;
 
 type BoxNixeBoundary = Box<crate::nixe::Boundary>;
+type BoxAtomicCAS128Args = Box<crate::isa::aarch64::inst::args::AtomicCAS128Args>;
 type BoxCallInfo = Box<CallInfo<ExternalName>>;
 type BoxCallIndInfo = Box<CallInfo<Reg>>;
 type BoxReturnCallInfo = Box<ReturnCallInfo<ExternalName>>;
@@ -75,6 +76,32 @@ pub struct ExtendedValue {
 }
 
 impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
+    fn atomic_cas128_args(
+        &mut self,
+        lse: bool,
+        flags: MemFlagsData,
+        addr: Reg,
+        expected_lo: Reg,
+        expected_hi: Reg,
+        replacement_lo: Reg,
+        replacement_hi: Reg,
+        old_lo: Writable<Reg>,
+        old_hi: Writable<Reg>,
+        scratch: Writable<Reg>,
+    ) -> BoxAtomicCAS128Args {
+        Box::new(crate::isa::aarch64::inst::args::AtomicCAS128Args {
+            lse,
+            flags,
+            addr,
+            expected_lo,
+            expected_hi,
+            replacement_lo,
+            replacement_hi,
+            old_lo,
+            old_hi,
+            scratch,
+        })
+    }
     fn abi_slot_amode(&mut self, offset: i32) -> AMode {
         if self.backend.flags.enable_nixe_abi() {
             AMode::RegOffset {

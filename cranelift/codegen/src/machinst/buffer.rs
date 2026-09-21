@@ -1654,6 +1654,14 @@ impl<I: VCodeInst> MachBuffer<I> {
 
         let alignment = self.finish_constants(constants);
 
+        assert!(
+            self.nixe_faults.iter().all(|map| {
+                map.fault_bytes != 0
+                    && u64::from(map.offset) + u64::from(map.fault_bytes) <= self.data.len() as u64
+            }),
+            "unfinished Nixe fault instruction"
+        );
+
         // Resolve all labels to their offsets.
         let finalized_relocs = self
             .relocs
@@ -1770,6 +1778,12 @@ impl<I: VCodeInst> MachBuffer<I> {
             "Nixe memory trap was not given allocation-visible prefault operands"
         );
         if let Some(mut state) = self.active_nixe_fault.clone() {
+            assert!(
+                self.nixe_faults
+                    .last()
+                    .is_none_or(|map| map.fault_bytes != 0),
+                "previous Nixe fault instruction was not completed"
+            );
             state.offset = self.cur_offset();
             self.nixe_faults.push(state);
         }
@@ -1777,6 +1791,38 @@ impl<I: VCodeInst> MachBuffer<I> {
             offset: self.data.len() as CodeOffset,
             code,
         });
+    }
+
+    /// Add a trap on a fixed-width native instruction.
+    #[cfg(feature = "arm64")]
+    pub(crate) fn add_trap_with_size(&mut self, code: TrapCode, bytes: u8) {
+        assert!(bytes != 0);
+        self.add_trap(code);
+        if self.active_nixe_fault.is_some() {
+            self.nixe_faults.last_mut().unwrap().fault_bytes = bytes;
+        }
+    }
+
+    /// Finish one variable-width native instruction, not a compound VCode op.
+    #[cfg(feature = "x86")]
+    pub(crate) fn finish_nixe_fault_instruction(&mut self, start: CodeOffset) {
+        let end = self.cur_offset();
+        if let Some(map) = self
+            .nixe_faults
+            .last_mut()
+            .filter(|map| map.fault_bytes == 0)
+        {
+            assert_eq!(
+                map.offset, start,
+                "Nixe fault is not at the instruction start"
+            );
+            let bytes = end.checked_sub(map.offset).unwrap();
+            assert!(
+                (1..=15).contains(&bytes),
+                "invalid x86-64 Nixe fault length"
+            );
+            map.fault_bytes = bytes as u8;
+        }
     }
 
     /// Add a call-site record at the current offset.

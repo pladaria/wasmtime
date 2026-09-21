@@ -68,6 +68,17 @@ pub struct LocatedValue {
     pub location: Location,
 }
 
+/// A terminal's already-charged deadline path. Both patches share the same
+/// physical operands. Resumption must use the hot patch, not repeat the charge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "enable-serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct PollCheckpoint {
+    /// Offset of the deadline exit patch, with the enclosing map's patch width.
+    pub offset: u32,
+    /// Work subtracted once before either patch; zero for already charged work.
+    pub completed: u16,
+}
+
 /// Final state at an exact native offset, after all preceding allocator edits.
 /// A state marker describes only its own point. Maps in `nixe_faults` instead
 /// describe the actual fault PC, preserving operands through compound ops.
@@ -80,8 +91,13 @@ pub struct StateMap {
     pub offset: u32,
     /// True when values are simultaneous fast-entry definitions, not uses.
     pub entry: bool,
-    /// Zero for a marker; 8 (x86-64) or 4 (AArch64) for an external exit.
+    /// Zero for a marker; 8 (x86-64) or 4 (AArch64) for an exit/check patch.
     pub patch_bytes: u8,
+    /// Exact native instruction length for a fault map; zero for other maps.
+    pub fault_bytes: u8,
+    /// Optional deadline patch after an inline budget subtraction/branch.
+    /// Mapped SSA values survive; machine condition flags are not retained.
+    pub poll: Option<PollCheckpoint>,
     /// Allocations in the same order as the CLIF boundary arguments.
     pub values: Vec<LocatedValue>,
 }
@@ -93,13 +109,32 @@ impl StateMap {
     /// mapping; this function provides neither synchronization nor W^X changes.
     /// Out-of-range targets require an owner-provided local island.
     pub fn patch_exit(&self, code: &mut [u8], base: u64, target: u64) -> crate::CodegenResult<()> {
+        self.patch_at(self.offset, code, base, target)
+    }
+
+    /// Install the cold deadline target in unpublished bytes. The target sees
+    /// an already-charged counter and the same operands as the normal exit.
+    pub fn patch_poll(&self, code: &mut [u8], base: u64, target: u64) -> crate::CodegenResult<()> {
+        let poll = self.poll.ok_or_else(|| {
+            crate::CodegenError::Unsupported("Nixe exit has no poll checkpoint".into())
+        })?;
+        self.patch_at(poll.offset, code, base, target)
+    }
+
+    fn patch_at(
+        &self,
+        offset: u32,
+        code: &mut [u8],
+        base: u64,
+        target: u64,
+    ) -> crate::CodegenResult<()> {
         let fail = |detail: &str| {
             crate::CodegenError::Unsupported(alloc::format!("Nixe exit patch: {detail}"))
         };
         let address = base
-            .checked_add(u64::from(self.offset))
+            .checked_add(u64::from(offset))
             .ok_or_else(|| fail("address overflow"))?;
-        let start = self.offset as usize;
+        let start = offset as usize;
         let end = start
             .checked_add(usize::from(self.patch_bytes))
             .ok_or_else(|| fail("offset overflow"))?;
@@ -139,6 +174,9 @@ pub struct Boundary {
     pub(crate) id: u64,
     pub(crate) entry: bool,
     pub(crate) exit: bool,
+    pub(crate) check: bool,
+    pub(crate) poll_cost: Option<u16>,
+    pub(crate) charge: Option<u16>,
     pub(crate) fault_pos: OperandPos,
     pub(crate) values: Vec<(Option<Reg>, Type)>,
     entry_constraints: Vec<EntryConstraint>,
@@ -149,6 +187,26 @@ impl Boundary {
         ctx: &mut Lower<I>,
         inst: ir::Inst,
     ) -> Option<(Box<Self>, InstOutput)> {
+        if let ir::InstructionData::UnaryImm {
+            opcode: ir::Opcode::NixeCharge,
+            imm,
+        } = *ctx.data(inst)
+        {
+            return Some((
+                Box::new(Self {
+                    id: 0,
+                    entry: false,
+                    exit: false,
+                    check: false,
+                    poll_cost: None,
+                    charge: Some(imm.bits() as u16),
+                    fault_pos: OperandPos::Early,
+                    values: Vec::new(),
+                    entry_constraints: Vec::new(),
+                }),
+                InstOutput::new(),
+            ));
+        }
         if let ir::InstructionData::NixeEntry { imm, .. } = *ctx.data(inst) {
             let mut outputs = InstOutput::new();
             let mut values = Vec::new();
@@ -163,6 +221,9 @@ impl Boundary {
                     id: imm.bits() as u64,
                     entry: true,
                     exit: false,
+                    check: false,
+                    poll_cost: None,
+                    charge: None,
                     fault_pos: OperandPos::Early,
                     values,
                     entry_constraints: ctx
@@ -190,6 +251,9 @@ impl Boundary {
                 id: imm.bits() as u64,
                 entry: false,
                 exit: opcode == ir::Opcode::NixeExit,
+                check: opcode == ir::Opcode::NixeCheck,
+                poll_cost: ctx.f.nixe_exit_costs.get(&(imm.bits() as u64)).copied(),
+                charge: None,
                 fault_pos: OperandPos::Early,
                 values,
                 entry_constraints: Vec::new(),
@@ -251,6 +315,8 @@ impl Boundary {
             offset: 0,
             entry: false,
             patch_bytes: 0,
+            fault_bytes: 0,
+            poll: None,
             values: self.locations(frame),
         }
     }
@@ -265,7 +331,16 @@ impl Boundary {
             id: self.id,
             offset: sink.cur_offset(),
             entry: self.entry,
-            patch_bytes: if self.exit { patch_bytes } else { 0 },
+            patch_bytes: if self.exit || self.check {
+                patch_bytes
+            } else {
+                0
+            },
+            fault_bytes: 0,
+            poll: self.poll_cost.map(|completed| PollCheckpoint {
+                offset: sink.cur_offset() + u32::from(patch_bytes),
+                completed,
+            }),
             values: self.locations(frame),
         });
     }

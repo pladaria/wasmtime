@@ -99,7 +99,13 @@ fn has_memory_fence_semantics(op: Opcode) -> bool {
         | Opcode::AtomicStore
         | Opcode::Fence
         | Opcode::Debugtrap
-        | Opcode::SequencePoint => true,
+        | Opcode::SequencePoint
+        // A Nixe span is a distinct guest memory observation with its own
+        // precise prefault state. Forwarding/CSE/DSE across its delimiters can
+        // erase an access or expose the wrong guest state on a fault. These
+        // are compiler barriers only; they emit no hardware fence.
+        | Opcode::NixeFaultStart
+        | Opcode::NixeFaultEnd => true,
         Opcode::Call | Opcode::CallIndirect | Opcode::TryCall | Opcode::TryCallIndirect => true,
         _ => false,
     }

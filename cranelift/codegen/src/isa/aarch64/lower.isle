@@ -2297,6 +2297,10 @@
 ;;;; Rules for `AtomicRMW` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (rule 1 (lower (and (use_lse)
+                  (atomic_rmw (valid_atomic_transaction ty) (little_or_native_endian flags) (AtomicRmwOp.Xchg) addr src)))
+      (lse_atomic_rmw (AtomicRMWOp.Swp) addr src ty flags))
+
+(rule 1 (lower (and (use_lse)
                   (atomic_rmw (valid_atomic_transaction ty) (little_or_native_endian flags) (AtomicRmwOp.Add) addr src)))
       (lse_atomic_rmw (AtomicRMWOp.Add) addr src ty flags))
 (rule 1 (lower (and (use_lse)
@@ -2349,6 +2353,12 @@
       (atomic_rmw_loop (AtomicRMWLoopOp.Xchg) addr src ty flags))
 
 ;;;; Rules for `AtomicCAS` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(rule 3 (lower (and (use_lse)
+                  (atomic_cas $I128 (little_or_native_endian flags) addr expect replace)))
+      (atomic_cas128 true flags addr expect replace))
+(rule 2 (lower (atomic_cas $I128 (little_or_native_endian flags) addr expect replace))
+      (atomic_cas128 false flags addr expect replace))
+
 (rule 1 (lower (and (use_lse)
                   (atomic_cas (valid_atomic_transaction ty) (little_or_native_endian flags) addr src1 src2)))
       (lse_atomic_cas addr src1 src2 ty flags))
@@ -2735,6 +2745,11 @@
 
 (rule (lower (get_pinned_reg _))
       (mov_from_preg (preg_pinned)))
+
+(rule (lower (nixe_arena_addr _ offset))
+      (let ((dst WritableReg (temp_writable_reg $I64))
+            (_ Unit (emit (MInst.NixeArenaAddr offset dst))))
+        (output_reg dst)))
 
 (rule (lower (set_pinned_reg val))
       (side_effect (write_pinned_reg val)))

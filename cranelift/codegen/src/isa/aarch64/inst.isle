@@ -289,6 +289,12 @@
         (oldval WritableReg)
         (scratch WritableReg))
 
+       ;; 128-bit CAS, using CASPAL or a validating LDAXP/STLXP loop.
+       ;; Fixed even register pairs avoid imposing pair constraints on regalloc.
+       ;; x6=address, x4:x5=replacement, x0:x1=result.
+       ;; Expected is x0:x1 (LSE) or x2:x3 (loop); x7 is loop status.
+       (AtomicCAS128 (data BoxAtomicCAS128Args))
+
        ;; An atomic read-modify-write operation. These instructions require the
        ;; Large System Extension (LSE) ISA support (FEAT_LSE). The instructions have
        ;; acquire-release semantics.
@@ -1006,6 +1012,7 @@
        ;; A pseudoinstruction that serves as a sequence point.
        (SequencePoint)
        (NixeBoundary (data BoxNixeBoundary))
+       (NixeArenaAddr (offset Reg) (dst WritableReg))
 
        ;; Emits an inline stack probe loop.
        ;;
@@ -1338,6 +1345,7 @@
 
 (type BoxCallInfo (primitive BoxCallInfo))
 (type BoxNixeBoundary (primitive BoxNixeBoundary))
+(type BoxAtomicCAS128Args (primitive BoxAtomicCAS128Args))
 (type BoxCallIndInfo (primitive BoxCallIndInfo))
 (type BoxReturnCallInfo (primitive BoxReturnCallInfo))
 (type BoxReturnCallIndInfo (primitive BoxReturnCallIndInfo))
@@ -4472,6 +4480,19 @@
             (scratch WritableReg (temp_writable_reg $I64))
             (_ Unit (emit (MInst.AtomicCASLoop ty flags addr expect replace dst scratch))))
         dst))
+
+(decl atomic_cas128 (bool MemFlagsData Reg ValueRegs ValueRegs) ValueRegs)
+(decl atomic_cas128_args (bool MemFlagsData Reg Reg Reg Reg Reg WritableReg WritableReg WritableReg) BoxAtomicCAS128Args)
+(extern constructor atomic_cas128_args atomic_cas128_args)
+(rule (atomic_cas128 lse flags addr expect replace)
+      (let ((lo WritableReg (temp_writable_reg $I64))
+            (hi WritableReg (temp_writable_reg $I64))
+            (scratch WritableReg (temp_writable_reg $I64))
+            (_ Unit (emit (MInst.AtomicCAS128 (atomic_cas128_args lse flags addr
+                (value_regs_get expect 0) (value_regs_get expect 1)
+                (value_regs_get replace 0) (value_regs_get replace 1)
+                lo hi scratch)))))
+        (value_regs lo hi)))
 
 ;; Helper for emitting `MInst.MovPReg` instructions.
 (attr mov_from_preg (veri chain))

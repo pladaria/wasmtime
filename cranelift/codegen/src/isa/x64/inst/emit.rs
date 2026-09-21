@@ -1832,20 +1832,60 @@ pub(crate) fn emit(
             // https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
             sink.put_data(&[0xf3, 0x0f, 0x1e, 0xfa]);
         }
+        Inst::NixeArenaAddr { offset, dst } => {
+            let amode = Amode::imm_reg_reg_shift(0, Gpr::unwrap_new(regs::r13()), *offset, 0);
+            // This instruction preserves flags. Bypass emit_maybe_shrink,
+            // which may replace an arithmetic LEA with a flag-writing ADD.
+            asm::inst::leaq_rm::<CraneliftRegisters>::new(*dst, amode).encode(
+                &mut external::AsmCodeSink {
+                    sink,
+                    incoming_arg_offset: 0,
+                    slot_offset: 0,
+                },
+            );
+        }
         Inst::NixeBoundary { data } => {
-            if data.exit {
-                while sink.cur_offset() % 8 != 0 {
+            if let Some(cost) = data.charge {
+                // LEA r14,[r14-cost]: preserve flags across ordinary SSA edges.
+                sink.put_data(&[0x4d, 0x8d, 0xb6]);
+                sink.put_data(&(-i32::from(cost)).to_le_bytes());
+            } else if data.check {
+                // TEST r14,r14; JG over the aligned cold patch. Resumption
+                // includes any allocator edits emitted after this instruction.
+                while (sink.cur_offset() + 5) % 8 != 0 {
                     sink.put1(0x90);
                 }
-            }
-            data.record(sink, state.frame_layout(), 8);
-            if data.exit {
-                // Unpublished exit. Its owner installs jmp rel32 + padding.
+                sink.put_data(&[0x4d, 0x85, 0xf6, 0x7f, 8]);
+                data.record(sink, state.frame_layout(), 8);
                 sink.put_data(&[0x0f, 0x0b, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90]);
+            } else {
+                if data.exit {
+                    let checkpoint_bytes = if data.poll_cost.is_some() { 9 } else { 0 };
+                    while (sink.cur_offset() + checkpoint_bytes) % 8 != 0 {
+                        sink.put1(0x90);
+                    }
+                }
+                if let Some(cost) = data.poll_cost {
+                    // SUB r14,imm32; JLE over the hot patch to the cold patch.
+                    // These bytes are one allocation-visible terminal: only the
+                    // reserved counter and non-SSA condition flags are changed.
+                    sink.put_data(&[0x49, 0x81, 0xee]);
+                    sink.put_data(&u32::from(cost).to_le_bytes());
+                    sink.put_data(&[0x7e, 8]);
+                }
+                data.record(sink, state.frame_layout(), 8);
+                if data.exit {
+                    // Unpublished exit. Its owner installs jmp rel32 + padding.
+                    sink.put_data(&[0x0f, 0x0b, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90]);
+                    if data.poll_cost.is_some() {
+                        sink.put_data(&[0x0f, 0x0b, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90]);
+                    }
+                }
             }
         }
 
         Inst::External { inst } => {
+            let instruction_start = sink.cur_offset();
             let frame = state.frame_layout();
             emit_maybe_shrink(
                 inst,
@@ -1865,6 +1905,9 @@ pub(crate) fn emit(
                     slot_offset: i32::try_from(frame.outgoing_args_size).unwrap(),
                 },
             );
+            // External emission encodes exactly one native instruction. Do not
+            // include the rest of a compound atomic or its allocator edits.
+            sink.finish_nixe_fault_instruction(instruction_start);
         }
     }
 

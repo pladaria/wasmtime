@@ -89,6 +89,11 @@ pub trait FuncWriter {
             writeln!(w, "]")?;
         }
 
+        for (id, cost) in &func.nixe_exit_costs {
+            any = true;
+            writeln!(w, "    nixe_poll {id} = {cost}")?;
+        }
+
         // Write out all signatures before functions since function declarations can refer to
         // signatures.
         for (sig, sig_data) in &func.dfg.signatures {
