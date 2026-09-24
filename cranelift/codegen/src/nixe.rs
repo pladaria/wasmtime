@@ -18,12 +18,17 @@
 //! entry, and resume at the hot patch after rearming rather than replaying work.
 //! `nixe_charge` subtracts a completed block's cost without checking the deadline
 //! or changing flags. A zero-cost terminal can check this already-charged work.
+//! `Function::nixe_exit_compares` explicitly establishes subtraction flags after
+//! the poll decision on both terminal paths. This is not implicit flag liveness
+//! across VCode instructions; only the final patches export that guarantee.
 
 use crate::{CodegenError, CodegenResult, ir, isa::TargetIsa};
 use alloc::format;
 
 mod boundary;
-pub use boundary::{Boundary, EntryConstraint, LocatedValue, Location, PollCheckpoint, StateMap};
+pub use boundary::{
+    Boundary, EntryConstraint, ExitCompare, LocatedValue, Location, PollCheckpoint, StateMap,
+};
 
 /// Bytes reserved for boundary transfers; never allocated to backend spills.
 pub const TRANSFER_BYTES: u32 = 2048;
@@ -150,10 +155,36 @@ mod chaining_tests;
 #[cfg(all(test, feature = "x86", feature = "arm64", feature = "disas"))]
 mod fp_effects_tests;
 
-/// Validate caller-supplied costs before optimizations can remove dead exits.
-pub(crate) fn validate_exit_costs(func: &ir::Function) -> CodegenResult<()> {
-    if func.nixe_exit_costs.is_empty() {
+/// Validate terminal metadata before optimizations can remove dead exits.
+pub(crate) fn validate_exit_metadata(func: &ir::Function) -> CodegenResult<()> {
+    if func.nixe_exit_costs.is_empty() && func.nixe_exit_compares.is_empty() {
         return Ok(());
+    }
+    for block in func.layout.blocks() {
+        for inst in func.layout.block_insts(block) {
+            if let ir::InstructionData::NixeBoundary {
+                opcode: ir::Opcode::NixeExit,
+                imm,
+                ..
+            } = func.dfg.insts[inst]
+                && let Some(compare) = func.nixe_exit_compares.get(&(imm.bits() as u64))
+            {
+                let args = func.dfg.inst_args(inst);
+                if !args
+                    .get(compare.lhs)
+                    .zip(args.get(compare.rhs))
+                    .is_some_and(|(&a, &b)| {
+                        let ty = func.dfg.value_type(a);
+                        matches!(ty, ir::types::I32 | ir::types::I64)
+                            && ty == func.dfg.value_type(b)
+                    })
+                {
+                    return Err(CodegenError::Unsupported(
+                        "Nixe exit comparison requires two same-width I32/I64 arguments".into(),
+                    ));
+                }
+            }
+        }
     }
     let ids: alloc::collections::BTreeSet<_> = func
         .layout
@@ -168,6 +199,11 @@ pub(crate) fn validate_exit_costs(func: &ir::Function) -> CodegenResult<()> {
             _ => None,
         })
         .collect();
+    if func.nixe_exit_compares.keys().any(|id| !ids.contains(id)) {
+        return Err(CodegenError::Unsupported(
+            "Nixe exit comparison names a missing exit ID".into(),
+        ));
+    }
     if func
         .nixe_exit_costs
         .iter()
@@ -187,9 +223,9 @@ pub(crate) fn validate(func: &ir::Function, isa: &dyn TargetIsa) -> CodegenResul
         ));
     }
     validate_entries(func, isa)?;
+    validate_exit_metadata(func)?;
     let mut boundary_ids = alloc::collections::BTreeSet::new();
     let mut entry_ids = alloc::collections::BTreeSet::new();
-    let mut exit_ids = alloc::collections::BTreeSet::new();
     for block in func.layout.blocks() {
         let mut fault_span = None;
         let mut fault_has_memory = false;
@@ -221,9 +257,6 @@ pub(crate) fn validate(func: &ir::Function, isa: &dyn TargetIsa) -> CodegenResul
                 ));
             }
             if let ir::InstructionData::NixeBoundary { imm, .. } = func.dfg.insts[inst] {
-                if op == ir::Opcode::NixeExit {
-                    exit_ids.insert(imm.bits() as u64);
-                }
                 if op == ir::Opcode::NixeFaultEnd {
                     if fault_span.take() != Some(imm.bits()) || !func.dfg.inst_args(inst).is_empty()
                     {
@@ -357,15 +390,6 @@ pub(crate) fn validate(func: &ir::Function, isa: &dyn TargetIsa) -> CodegenResul
     {
         return Err(CodegenError::Unsupported(
             "Nixe entry constraints name a missing entry ID".into(),
-        ));
-    }
-    if func
-        .nixe_exit_costs
-        .iter()
-        .any(|(id, cost)| !exit_ids.contains(id) || *cost > 2048)
-    {
-        return Err(CodegenError::Unsupported(
-            "Nixe checkpoint requires an exit ID and cost in 0..=2048".into(),
         ));
     }
     if !isa.flags().enable_nixe_abi() {

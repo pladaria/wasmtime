@@ -6,6 +6,203 @@ use alloc::vec::Vec;
 
 const COUNT: usize = 40;
 
+#[test]
+fn exit_comparisons_own_flags_on_both_poll_paths_under_pressure() {
+    for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        for allocator in ["single_pass", "backtracking"] {
+            let isa = target(triple, allocator, true);
+            for ty in [types::I32, types::I64] {
+                for cost in [None, Some(0), Some(2048)] {
+                    let mut f = ir::Function::new();
+                    let block = f.dfg.make_block();
+                    f.layout.append_block(block);
+                    let mut signature = ir::Signature::new(crate::isa::CallConv::SystemV);
+                    signature.returns = (0..COUNT).map(|_| ir::AbiParam::new(ty)).collect();
+                    let signature = f.import_signature(signature);
+                    let mut c = FuncCursor::new(&mut f).at_bottom(block);
+                    let entry = c.ins().nixe_entry(signature, 1);
+                    let values = c.func.dfg.inst_results(entry).to_vec();
+                    c.ins().nixe_exit(2, &values);
+                    f.nixe_exit_compares.insert(
+                        2,
+                        super::ExitCompare {
+                            lhs: 0,
+                            rhs: COUNT - 1,
+                        },
+                    );
+                    if let Some(cost) = cost {
+                        f.nixe_exit_costs.insert(2, cost);
+                    }
+                    let code = compile(f, &*isa).unwrap();
+                    let maps = &code.buffer.nixe_states;
+                    assert!(!maps[0].subtract_flags);
+                    let map = &maps[1];
+                    assert!(map.subtract_flags);
+                    let reg = |index: usize| match map.values[index].location {
+                        Location::Register {
+                            index,
+                            vector: false,
+                        } => index,
+                        other => panic!("compare operand was not constrained: {other:?}"),
+                    };
+                    let (lhs, rhs) = (reg(0), reg(COUNT - 1));
+                    assert!(
+                        map.values
+                            .iter()
+                            .any(|v| matches!(v.location, Location::Spill { .. }))
+                    );
+                    let cmp = if triple.starts_with("x86") {
+                        vec![
+                            0x40 | if ty == types::I64 { 8 } else { 0 }
+                                | ((rhs >> 3) << 2)
+                                | (lhs >> 3),
+                            0x39,
+                            0xc0 | ((rhs & 7) << 3) | (lhs & 7),
+                        ]
+                    } else {
+                        let word = if ty == types::I64 {
+                            0xeb00001fu32
+                        } else {
+                            0x6b00001f
+                        } | (u32::from(rhs) << 16)
+                            | (u32::from(lhs) << 5);
+                        word.to_le_bytes().to_vec()
+                    };
+                    let bytes = code.code_buffer();
+                    let end = map.offset as usize;
+                    assert_eq!(&bytes[end - cmp.len()..end], &cmp);
+                    if let Some(poll) = map.poll {
+                        assert_eq!(poll.offset, map.offset + 2 * u32::from(map.patch_bytes));
+                        let cold_cmp = end + usize::from(map.patch_bytes);
+                        assert_eq!(&bytes[cold_cmp..cold_cmp + cmp.len()], &cmp);
+                        assert_eq!(Some(poll.completed), cost);
+                    } else {
+                        assert_eq!(cost, None);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn exit_comparisons_reject_invalid_operands_and_clear_with_function() {
+    let isa = target("x86_64-unknown-linux-gnu", "backtracking", true);
+    for (a, b, lhs, rhs, id) in [
+        (types::I32, types::I64, 0, 1, 2),
+        (types::I8, types::I8, 0, 1, 2),
+        (types::I64, types::I64, 0, 2, 2),
+        (types::I64, types::I64, 0, 1, 99),
+    ] {
+        let mut f = ir::Function::new();
+        let block = f.dfg.make_block();
+        f.layout.append_block(block);
+        let mut c = FuncCursor::new(&mut f).at_bottom(block);
+        let a = c.ins().iconst(a, 1);
+        let b = c.ins().iconst(b, 2);
+        c.ins().nixe_exit(2, &[a, b]);
+        f.nixe_exit_compares
+            .insert(id, super::ExitCompare { lhs, rhs });
+        assert!(
+            compile(f.clone(), &*isa)
+                .unwrap_err()
+                .contains("Nixe exit comparison")
+        );
+        f.clear();
+        assert!(f.nixe_exit_compares.is_empty());
+    }
+}
+
+#[test]
+fn literal_boundaries_preserve_exact_bits_without_allocating_registers() {
+    for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        for allocator in ["single_pass", "backtracking"] {
+            let isa = target(triple, allocator, true);
+            let mut f = ir::Function::new();
+            let block = f.dfg.make_block();
+            f.layout.append_block(block);
+            let vector = 0xff80_0000_7654_3210_fedc_ba98_0123_4567u128;
+            let handle = f
+                .dfg
+                .constants
+                .insert(vector.to_le_bytes().as_slice().into());
+            let mut c = FuncCursor::new(&mut f).at_bottom(block);
+            let pointer = c.ins().get_pinned_reg(types::I64);
+            let args = [
+                c.ins().iconst(types::I8, -1),
+                c.ins().iconst(types::I16, 0x8123),
+                c.ins().iconst(types::I32, 0xfedc_ba98),
+                c.ins().iconst(types::I64, -2),
+                c.ins()
+                    .f32const(ir::immediates::Ieee32::with_bits(0x7f80_0123)),
+                c.ins()
+                    .f64const(ir::immediates::Ieee64::with_bits(0x8000_0000_0000_0000)),
+                c.ins().vconst(types::I8X16, handle),
+            ];
+            c.ins().nixe_state(1, &args);
+            c.ins().nixe_fault_start(2, &args);
+            let loaded = c.ins().load(types::I64, MemFlagsData::new(), pointer, 0);
+            c.ins().nixe_fault_end(2, &[]);
+            let mut exit = args.to_vec();
+            exit.push(loaded);
+            c.ins().nixe_exit(3, &exit);
+            let code = compile(f, &*isa).unwrap();
+            let expected = [
+                [0xff, 0],
+                [0x8123, 0],
+                [0xfedc_ba98, 0],
+                [u64::MAX - 1, 0],
+                [0x7f80_0123, 0],
+                [0x8000_0000_0000_0000, 0],
+                [vector as u64, (vector >> 64) as u64],
+            ];
+            for map in code
+                .buffer
+                .nixe_states
+                .iter()
+                .chain(&code.buffer.nixe_faults)
+            {
+                for (actual, expected) in map.values.iter().zip(expected) {
+                    assert_eq!(
+                        actual.location,
+                        Location::Constant(expected),
+                        "{triple} {allocator}"
+                    );
+                }
+            }
+            assert_eq!(code.buffer.nixe_states.len(), 2);
+            assert_eq!(code.buffer.nixe_faults.len(), 1);
+            assert!(code.buffer.nixe_faults[0].fault_bytes > 0);
+            assert!(matches!(
+                code.buffer.nixe_states[1].values.last().unwrap().location,
+                Location::Register { .. } | Location::Spill { .. }
+            ));
+
+            // Boundary-only literals add metadata but no machine instructions,
+            // spill area, or constant pool. No alternate emission path is used.
+            let sizes: Vec<_> = [0, 80]
+                .into_iter()
+                .map(|count| {
+                    let mut f = ir::Function::new();
+                    let block = f.dfg.make_block();
+                    f.layout.append_block(block);
+                    let mut c = FuncCursor::new(&mut f).at_bottom(block);
+                    let values: Vec<_> = (0..count)
+                        .map(|i| c.ins().iconst(types::I64, 0x1234_5678_0000_0000 + i))
+                        .collect();
+                    c.ins().nixe_exit(1, &values);
+                    let code = compile(f, &*isa).unwrap();
+                    (
+                        code.code_buffer().len(),
+                        code.buffer.frame_layout().unwrap().nixe_frame_size,
+                    )
+                })
+                .collect();
+            assert_eq!(sizes[0], sizes[1], "{triple} {allocator}");
+        }
+    }
+}
+
 #[cfg(feature = "disas")]
 #[test]
 fn guest_fault_delimiters_prevent_cross_access_forwarding_without_hardware_fences() {
@@ -85,23 +282,42 @@ fn constant_branch_removes_dead_checkpoint_costs_without_hiding_invalid_input() 
         let mut cursor = FuncCursor::new(&mut f);
         cursor.goto_bottom(entry);
         let condition = cursor.ins().iconst(types::I8, 1);
+        let first = cursor.ins().iconst(types::I64, 4);
+        let second = cursor.ins().iconst(types::I64, 6);
         cursor.ins().brif(condition, live, &[], dead, &[]);
         cursor.goto_bottom(live);
-        cursor.ins().nixe_exit(1, &[]);
+        cursor.ins().nixe_exit(1, &[first, second]);
         cursor.goto_bottom(dead);
-        cursor.ins().nixe_exit(2, &[]);
+        cursor.ins().nixe_exit(2, &[first, second]);
         f.nixe_exit_costs.insert(1, 7);
         f.nixe_exit_costs.insert(2, 13);
+        for id in [1, 2] {
+            f.nixe_exit_compares
+                .insert(id, super::ExitCompare { lhs: 0, rhs: 1 });
+        }
         let mut context = crate::Context::for_function(f.clone());
         context
             .compile(&*isa, &mut crate::control::ControlPlane::default())
             .unwrap();
         assert_eq!(context.func.nixe_exit_costs.len(), 1);
         assert_eq!(context.func.nixe_exit_costs.get(&1), Some(&7));
+        assert_eq!(context.func.nixe_exit_compares.len(), 1);
+        assert!(context.func.nixe_exit_compares.contains_key(&1));
         let maps = &context.compiled_code().unwrap().buffer.nixe_states;
         assert_eq!(maps.len(), 1);
         assert_eq!(maps[0].id, 1);
         assert_eq!(maps[0].poll.unwrap().completed, 7);
+        assert!(maps[0].subtract_flags);
+
+        let mut invalid = f.clone();
+        invalid
+            .nixe_exit_compares
+            .insert(2, super::ExitCompare { lhs: 0, rhs: 2 });
+        assert!(
+            compile(invalid, &*isa)
+                .unwrap_err()
+                .contains("Nixe exit comparison")
+        );
 
         // Invalid costs must fail even if the corresponding exit would die.
         f.nixe_exit_costs.insert(2, 2049);
@@ -791,6 +1007,7 @@ fn nixe_exit_patch_range_alignment_and_direction() {
             patch_bytes: bytes,
             fault_bytes: 0,
             poll: None,
+            subtract_flags: false,
             values: Vec::new(),
         };
         let base = 1u64 << 32;
@@ -1173,6 +1390,7 @@ fn nixe_boundaries_export_final_allocations_and_aligned_patch_units() {
                             }
                             Location::Register { .. } => {}
                             Location::Unused => panic!("boundary operand was lost"),
+                            Location::Constant(_) => panic!("loaded inputs are not literals"),
                         }
                     }
                 }
@@ -1273,6 +1491,7 @@ fn nixe_exit_maps_reconstruct_native_registers_and_spills() {
                     } as u32;
                     match value.location {
                         Location::Unused => continue,
+                        Location::Constant(_) => panic!("entry definitions are not constants"),
                         Location::Register {
                             index,
                             vector: false,
@@ -1368,6 +1587,7 @@ fn nixe_exit_maps_reconstruct_native_registers_and_spills() {
                 for (value, expected) in map.values.iter().zip(expected) {
                     let offset = match value.location {
                         Location::Unused => panic!("exit operand was lost"),
+                        Location::Constant(_) => panic!("loaded inputs are not literals"),
                         Location::Spill { offset } => offset as usize,
                         Location::Register { index, vector } => {
                             FRAME_BYTES as usize

@@ -227,9 +227,15 @@ pub struct FunctionStencil {
     /// Optional terminal budget checkpoints keyed by `nixe_exit` ID. Subtract
     /// 0..=2048 completed instructions from r14/x20, then select the deadline
     /// patch when the signed balance is nonpositive. All mapped SSA operands
-    /// survive; host condition flags do not. Zero checks work already charged
+    /// survive; ambient condition flags do not. `nixe_exit_compares` can
+    /// explicitly produce new flags after the decision. Zero checks work already charged
     /// by `nixe_charge` without charging it again. Set before compilation.
     pub nixe_exit_costs: alloc::collections::BTreeMap<u64, u16>,
+
+    /// Optional terminal comparisons, using ordered boundary argument indices.
+    /// The comparison executes after the poll decision and allocator edits,
+    /// establishing host subtraction flags at both exported exit patches.
+    pub nixe_exit_compares: alloc::collections::BTreeMap<u64, crate::nixe::ExitCompare>,
 
     /// An optional global value which represents an expression evaluating to
     /// the stack limit for this function. This `GlobalValue` will be
@@ -253,6 +259,7 @@ impl FunctionStencil {
         self.nixe_entries.clear();
         self.nixe_entry_constraints.clear();
         self.nixe_exit_costs.clear();
+        self.nixe_exit_compares.clear();
         self.stack_limit = None;
     }
 
@@ -458,6 +465,7 @@ impl Function {
                 nixe_entries: alloc::vec::Vec::new(),
                 nixe_entry_constraints: alloc::collections::BTreeMap::new(),
                 nixe_exit_costs: alloc::collections::BTreeMap::new(),
+                nixe_exit_compares: alloc::collections::BTreeMap::new(),
             },
             params: FunctionParameters::new(),
         }

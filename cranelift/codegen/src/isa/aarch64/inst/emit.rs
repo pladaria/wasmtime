@@ -3660,7 +3660,30 @@ impl MachInstEmit for Inst {
                 sink.put4(enc_arith_rrr(0b10001011_000, 0, *dst, xreg(19), *offset));
             }
             Inst::NixeBoundary { data } => {
-                if let Some(cost) = data.charge {
+                if let Some((lhs, rhs, ty)) = data.comparison() {
+                    // Fused CMP + patch: allocator edits and poll arithmetic
+                    // precede the flag producer on both paths. C is not-borrow.
+                    // https://developer.arm.com/documentation/ddi0602/2025-12/Base-Instructions/CMP--shifted-register---Compare--shifted-register---an-alias-of-SUBS--shifted-register--
+                    let lhs = u32::from(lhs.to_real_reg().unwrap().hw_enc());
+                    let rhs = u32::from(rhs.to_real_reg().unwrap().hw_enc());
+                    let compare = if ty.bits() == 64 {
+                        0xeb00001f
+                    } else {
+                        0x6b00001f
+                    } | (rhs << 16)
+                        | (lhs << 5);
+                    if let Some(cost) = data.poll_cost {
+                        sink.put4(0xf1000294 | (u32::from(cost) << 10));
+                        sink.put4(0x5400006d); // B.LE over CMP + hot patch
+                    }
+                    sink.put4(compare);
+                    data.record(sink, state.frame_layout(), 4);
+                    sink.put4(0xd4200000);
+                    if data.poll_cost.is_some() {
+                        sink.put4(compare);
+                        sink.put4(0xd4200000);
+                    }
+                } else if let Some(cost) = data.charge {
                     // SUB (not SUBS) x20,x20,#cost: preserve NZCV.
                     sink.put4(0xd1000294 | (u32::from(cost) << 10));
                 } else if data.check {

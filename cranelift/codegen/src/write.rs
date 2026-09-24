@@ -93,6 +93,14 @@ pub trait FuncWriter {
             any = true;
             writeln!(w, "    nixe_poll {id} = {cost}")?;
         }
+        for (id, compare) in &func.nixe_exit_compares {
+            any = true;
+            writeln!(
+                w,
+                "    ; nixe_exit_compare {id}: {}, {}",
+                compare.lhs, compare.rhs
+            )?;
+        }
 
         // Write out all signatures before functions since function declarations can refer to
         // signatures.

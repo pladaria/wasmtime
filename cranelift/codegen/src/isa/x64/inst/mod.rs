@@ -1493,9 +1493,10 @@ impl MachInst for Inst {
     }
 
     fn worst_case_size() -> CodeOffset {
-        // A checked Nixe terminal is a compound instruction: up to seven
-        // alignment bytes, SUB/JLE (9), and two eight-byte exit patches.
-        32
+        // A checked Nixe comparison terminal includes up to seven alignment
+        // bytes, SUB/JLE (9), CMP (3), hot patch (8), CMP/padding (8), cold
+        // patch (8). Keep island checks valid for this indivisible producer.
+        43
     }
 
     fn gen_block_start(indirect: bool, cfi: bool) -> Option<Self> {

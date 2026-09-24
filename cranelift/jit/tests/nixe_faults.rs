@@ -250,6 +250,11 @@ fn nixe_native_prefault_registers_and_spills() {
                     for (value, expected) in map.values.iter().zip(expected) {
                         let actual = match value.location {
                             Location::Unused => panic!("lost prefault value"),
+                            Location::Constant(bits) => bits
+                                .iter()
+                                .flat_map(|word| word.to_le_bytes())
+                                .take(value.ty.bytes() as usize)
+                                .collect(),
                             Location::Spill { offset } => frame.bytes
                                 [offset as usize..offset as usize + value.ty.bytes() as usize]
                                 .to_vec(),

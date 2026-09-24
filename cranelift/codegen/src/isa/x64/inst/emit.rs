@@ -1845,7 +1845,38 @@ pub(crate) fn emit(
             );
         }
         Inst::NixeBoundary { data } => {
-            if let Some(cost) = data.charge {
+            if let Some((lhs, rhs, ty)) = data.comparison() {
+                // CMP has allocation-visible register inputs and is fused with
+                // the terminal. Nothing can edit registers or flags between
+                // this producer and either exported patch. CF means borrow.
+                // Intel SDM, CMP: https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
+                let lhs = lhs.to_real_reg().unwrap().hw_enc();
+                let rhs = rhs.to_real_reg().unwrap().hw_enc();
+                let compare = [
+                    0x40 | if ty.bits() == 64 { 8 } else { 0 } | ((rhs >> 3) << 2) | (lhs >> 3),
+                    0x39,
+                    0xc0 | ((rhs & 7) << 3) | (lhs & 7),
+                ];
+                let prefix = if data.poll_cost.is_some() { 9 } else { 0 };
+                while (sink.cur_offset() + prefix + 3) % 8 != 0 {
+                    sink.put1(0x90);
+                }
+                if let Some(cost) = data.poll_cost {
+                    sink.put_data(&[0x49, 0x81, 0xee]); // SUB r14,cost
+                    sink.put_data(&u32::from(cost).to_le_bytes());
+                    sink.put_data(&[0x7e, 11]); // JLE over CMP + hot patch
+                }
+                sink.put_data(&compare);
+                data.record(sink, state.frame_layout(), 8);
+                sink.put_data(&[0x0f, 0x0b, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90]);
+                if data.poll_cost.is_some() {
+                    sink.put_data(&compare);
+                    for _ in 0..5 {
+                        sink.put1(0x90);
+                    }
+                    sink.put_data(&[0x0f, 0x0b, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90]);
+                }
+            } else if let Some(cost) = data.charge {
                 // LEA r14,[r14-cost]: preserve flags across ordinary SSA edges.
                 sink.put_data(&[0x4d, 0x8d, 0xb6]);
                 sink.put_data(&(-i32::from(cost)).to_le_bytes());

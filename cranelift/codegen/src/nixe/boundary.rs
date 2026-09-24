@@ -44,6 +44,9 @@ pub enum Location {
     /// An entry result eliminated by optimization/lowering; transfer nothing.
     /// Exit and observation operands never have this location.
     Unused,
+    /// Exact low/high 64-bit words of a literal. No allocation is required.
+    /// This is a use-only location; entry definitions cannot be constants.
+    Constant([u64; 2]),
     /// Architectural register number and register bank.
     Register {
         /// Architectural register encoding.
@@ -79,6 +82,18 @@ pub struct PollCheckpoint {
     pub completed: u16,
 }
 
+/// Establish subtraction flags at an exit, not an ambient flag-liveness claim.
+/// Both arguments must have the same I32 or I64 type. Their registers are
+/// allocation-visible uses of the terminal; neither is modified by CMP.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "enable-serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ExitCompare {
+    /// Minuend boundary argument index.
+    pub lhs: usize,
+    /// Subtrahend boundary argument index.
+    pub rhs: usize,
+}
+
 /// Final state at an exact native offset, after all preceding allocator edits.
 /// A state marker describes only its own point. Maps in `nixe_faults` instead
 /// describe the actual fault PC, preserving operands through compound ops.
@@ -96,8 +111,12 @@ pub struct StateMap {
     /// Exact native instruction length for a fault map; zero for other maps.
     pub fault_bytes: u8,
     /// Optional deadline patch after an inline budget subtraction/branch.
-    /// Mapped SSA values survive; machine condition flags are not retained.
+    /// Mapped SSA values survive; only `subtract_flags` guarantees host flags.
     pub poll: Option<PollCheckpoint>,
+    /// The terminal establishes all host integer subtraction condition flags
+    /// at both patches. x86 CF is borrow; AArch64 C is not-borrow. No claim is
+    /// made about flags at entry, ordinary markers or fault instructions.
+    pub subtract_flags: bool,
     /// Allocations in the same order as the CLIF boundary arguments.
     pub values: Vec<LocatedValue>,
 }
@@ -177,12 +196,60 @@ pub struct Boundary {
     pub(crate) check: bool,
     pub(crate) poll_cost: Option<u16>,
     pub(crate) charge: Option<u16>,
+    compare: Option<ExitCompare>,
     pub(crate) fault_pos: OperandPos,
-    pub(crate) values: Vec<(Option<Reg>, Type)>,
+    values: Vec<(BoundaryValue, Type)>,
     entry_constraints: Vec<EntryConstraint>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum BoundaryValue {
+    Unused,
+    Register(Reg),
+    Constant([u64; 2]),
+}
+
 impl Boundary {
+    // Consume only literal definitions in the optimized backend input, never
+    // predict an allocator location from SSA. Constants are carried unchanged
+    // through allocation and emitted in the final map; other values remain
+    // real allocator operands. Avoiding put_input_in_regs also permits a
+    // boundary-only literal to disappear from the machine instruction stream.
+    fn constant<I: VCodeInst>(ctx: &Lower<I>, inst: ir::Inst, index: usize) -> Option<[u64; 2]> {
+        let value = ctx.input_as_value(inst, index);
+        let definition = ctx.dfg().value_def(value).inst()?;
+        match *ctx.data(definition) {
+            ir::InstructionData::UnaryImm {
+                opcode: ir::Opcode::Iconst,
+                imm,
+            } => {
+                let bits = ctx.value_ty(value).bits();
+                (bits <= 64).then(|| [(imm.bits() as u64) & (u64::MAX >> (64 - bits)), 0])
+            }
+            ir::InstructionData::UnaryIeee32 {
+                opcode: ir::Opcode::F32const,
+                imm,
+            } => Some([u64::from(imm.bits()), 0]),
+            ir::InstructionData::UnaryIeee64 {
+                opcode: ir::Opcode::F64const,
+                imm,
+            } => Some([imm.bits(), 0]),
+            ir::InstructionData::UnaryConst {
+                opcode: ir::Opcode::Vconst,
+                constant_handle,
+            } => {
+                let bytes = ctx.get_constant_data(constant_handle).as_slice();
+                (bytes.len() == 16).then(|| {
+                    [
+                        u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                        u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+                    ]
+                })
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn lower<I: VCodeInst>(
         ctx: &mut Lower<I>,
         inst: ir::Inst,
@@ -200,6 +267,7 @@ impl Boundary {
                     check: false,
                     poll_cost: None,
                     charge: Some(imm.bits() as u16),
+                    compare: None,
                     fault_pos: OperandPos::Early,
                     values: Vec::new(),
                     entry_constraints: Vec::new(),
@@ -213,7 +281,12 @@ impl Boundary {
             for index in 0..ctx.num_outputs(inst) {
                 let ty = ctx.output_ty(inst, index);
                 let reg = ctx.alloc_tmp(ty).only_reg().unwrap().to_reg();
-                values.push((ctx.nixe_result_is_used(inst, index).then_some(reg), ty));
+                let value = if ctx.nixe_result_is_used(inst, index) {
+                    BoundaryValue::Register(reg)
+                } else {
+                    BoundaryValue::Unused
+                };
+                values.push((value, ty));
                 outputs.push(ValueRegs::one(reg));
             }
             return Some((
@@ -224,6 +297,7 @@ impl Boundary {
                     check: false,
                     poll_cost: None,
                     charge: None,
+                    compare: None,
                     fault_pos: OperandPos::Early,
                     values,
                     entry_constraints: ctx
@@ -239,11 +313,18 @@ impl Boundary {
         let ir::InstructionData::NixeBoundary { opcode, imm, .. } = *ctx.data(inst) else {
             return None;
         };
+        let compare = ctx.f.nixe_exit_compares.get(&(imm.bits() as u64)).copied();
         let values = (0..ctx.num_inputs(inst))
             .map(|index| {
                 let ty = ctx.input_ty(inst, index);
-                let reg = ctx.put_input_in_regs(inst, index).only_reg().unwrap();
-                (Some(reg), ty)
+                let value = if compare.is_some_and(|c| index == c.lhs || index == c.rhs) {
+                    BoundaryValue::Register(ctx.put_input_in_regs(inst, index).only_reg().unwrap())
+                } else if let Some(bits) = Self::constant(ctx, inst, index) {
+                    BoundaryValue::Constant(bits)
+                } else {
+                    BoundaryValue::Register(ctx.put_input_in_regs(inst, index).only_reg().unwrap())
+                };
+                (value, ty)
             })
             .collect();
         Some((
@@ -254,6 +335,7 @@ impl Boundary {
                 check: opcode == ir::Opcode::NixeCheck,
                 poll_cost: ctx.f.nixe_exit_costs.get(&(imm.bits() as u64)).copied(),
                 charge: None,
+                compare,
                 fault_pos: OperandPos::Early,
                 values,
                 entry_constraints: Vec::new(),
@@ -263,8 +345,18 @@ impl Boundary {
     }
 
     pub(crate) fn operands(&mut self, collector: &mut impl OperandVisitor) {
-        for (index, (reg, _)) in self.values.iter_mut().enumerate() {
-            let Some(reg) = reg else {
+        // Give mandatory register uses first choice before single-pass
+        // allocation places flexible map-only values in remaining registers.
+        let required = |index: &usize| {
+            self.compare
+                .is_some_and(|c| *index == c.lhs || *index == c.rhs)
+        };
+        let indices = (0..self.values.len())
+            .filter(required)
+            .chain((0..self.values.len()).filter(|i| !required(i)));
+        for index in indices {
+            let (reg, _) = &mut self.values[index];
+            let BoundaryValue::Register(reg) = reg else {
                 continue;
             };
             let (kind, pos) = if self.entry {
@@ -278,6 +370,13 @@ impl Boundary {
                 .copied()
                 .unwrap_or(EntryConstraint::Any)
             {
+                EntryConstraint::Any
+                    if self
+                        .compare
+                        .is_some_and(|c| index == c.lhs || index == c.rhs) =>
+                {
+                    OperandConstraint::Reg
+                }
                 EntryConstraint::Any => OperandConstraint::Any,
                 EntryConstraint::Register { index, vector } => {
                     OperandConstraint::FixedReg(regalloc2::PReg::new(
@@ -296,7 +395,11 @@ impl Boundary {
 
     pub(crate) fn fault_operands(&mut self, collector: &mut impl OperandVisitor) {
         for (reg, _) in &mut self.values {
-            let reg = reg.as_mut().expect("prefault values are always used");
+            let reg = match reg {
+                BoundaryValue::Register(reg) => reg,
+                BoundaryValue::Constant(_) => continue,
+                BoundaryValue::Unused => unreachable!("prefault values are always used"),
+            };
             // A precise single memory instruction faults before its defs;
             // a compound operation may have already written intermediate
             // results, so it must preserve these values through every def.
@@ -317,6 +420,7 @@ impl Boundary {
             patch_bytes: 0,
             fault_bytes: 0,
             poll: None,
+            subtract_flags: false,
             values: self.locations(frame),
         }
     }
@@ -338,22 +442,49 @@ impl Boundary {
             },
             fault_bytes: 0,
             poll: self.poll_cost.map(|completed| PollCheckpoint {
-                offset: sink.cur_offset() + u32::from(patch_bytes),
+                // Each path has its own CMP immediately before its patch.
+                // CMP plus alignment occupies one additional patch width.
+                offset: sink.cur_offset()
+                    + u32::from(patch_bytes) * if self.compare.is_some() { 2 } else { 1 },
                 completed,
             }),
+            subtract_flags: self.compare.is_some(),
             values: self.locations(frame),
         });
+    }
+
+    /// Physical compare operands after allocation. Register constraints keep
+    /// the fused terminal free of scratch registers and late spill reloads.
+    pub(crate) fn comparison(&self) -> Option<(Reg, Reg, Type)> {
+        let compare = self.compare?;
+        let (BoundaryValue::Register(lhs), ty) = self.values[compare.lhs] else {
+            unreachable!("comparison operand must be allocated")
+        };
+        let (BoundaryValue::Register(rhs), _) = self.values[compare.rhs] else {
+            unreachable!("comparison operand must be allocated")
+        };
+        assert!(lhs.to_real_reg().is_some() && rhs.to_real_reg().is_some());
+        Some((lhs, rhs, ty))
     }
 
     fn locations(&self, frame: &FrameLayout) -> Vec<LocatedValue> {
         self.values
             .iter()
             .map(|&(reg, ty)| {
-                let Some(reg) = reg else {
-                    return LocatedValue {
-                        ty,
-                        location: Location::Unused,
-                    };
+                let reg = match reg {
+                    BoundaryValue::Register(reg) => reg,
+                    BoundaryValue::Unused => {
+                        return LocatedValue {
+                            ty,
+                            location: Location::Unused,
+                        };
+                    }
+                    BoundaryValue::Constant(bits) => {
+                        return LocatedValue {
+                            ty,
+                            location: Location::Constant(bits),
+                        };
+                    }
                 };
                 let location = if let Some(slot) = reg.to_spillslot() {
                     let offset = super::TRANSFER_BYTES

@@ -228,6 +228,7 @@ fn nixe_independent_fragments_accept_empty_and_cyclic_transfers() {
                             patch_bytes: if x64 { 8 } else { 4 },
                             fault_bytes: 0,
                             poll: None,
+                            subtract_flags: false,
                             values: vec![],
                         };
                         bytes.resize(bytes.len() + patch.patch_bytes as usize, 0);

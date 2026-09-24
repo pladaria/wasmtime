@@ -54,6 +54,7 @@ pub fn eliminate_unreachable_code(
             } = pos.func.dfg.insts[inst]
             {
                 pos.func.nixe_exit_costs.remove(&(imm.bits() as u64));
+                pos.func.nixe_exit_compares.remove(&(imm.bits() as u64));
             }
             pos.func.layout.remove_inst(inst);
         }
