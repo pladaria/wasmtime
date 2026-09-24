@@ -201,6 +201,42 @@ pub struct FunctionStencil {
     /// call instructions.
     pub debug_tags: DebugTags,
 
+    /// Preserve native floating-point environment effects for Nixe lowering.
+    /// FP arithmetic, comparisons, rounding and conversions execute in source
+    /// order relative to other effects, even when their results are unused.
+    /// They are opaque to value rewrites: the caller owns the dynamic host FP
+    /// control/status environment, rather than CLIF's default FP assumptions.
+    /// This does not make backend expansions implement guest FP semantics;
+    /// the frontend must still guard their supported operand/control domain.
+    /// Bitwise FP operations (negation, absolute value, copysign) remain pure.
+    /// Set before optimization. Independent of the leaf calling convention.
+    pub nixe_observable_fp: bool,
+
+    /// Nixe canonical external entries, in caller order. Set with
+    /// `nixe::set_entries`; the layout's first block is then analysis-only.
+    /// Entries have no block parameters and define their own live inputs.
+    pub nixe_entries: alloc::vec::Vec<Block>,
+
+    /// Optional physical constraints keyed by `nixe_entry`'s opaque ID, in
+    /// original result order. Omitted entries use allocation-chosen locations.
+    /// Set before compilation; validation rejects missing IDs, wrong arity,
+    /// register-bank mismatches, reserved registers and overlapping inputs.
+    pub nixe_entry_constraints:
+        alloc::collections::BTreeMap<u64, alloc::vec::Vec<crate::nixe::EntryConstraint>>,
+
+    /// Optional terminal budget checkpoints keyed by `nixe_exit` ID. Subtract
+    /// 0..=2048 completed instructions from r14/x20, then select the deadline
+    /// patch when the signed balance is nonpositive. All mapped SSA operands
+    /// survive; ambient condition flags do not. `nixe_exit_compares` can
+    /// explicitly produce new flags after the decision. Zero checks work already charged
+    /// by `nixe_charge` without charging it again. Set before compilation.
+    pub nixe_exit_costs: alloc::collections::BTreeMap<u64, u16>,
+
+    /// Optional terminal comparisons, using ordered boundary argument indices.
+    /// The comparison executes after the poll decision and allocator edits,
+    /// establishing host subtraction flags at both exported exit patches.
+    pub nixe_exit_compares: alloc::collections::BTreeMap<u64, crate::nixe::ExitCompare>,
+
     /// An optional global value which represents an expression evaluating to
     /// the stack limit for this function. This `GlobalValue` will be
     /// interpreted in the prologue, if necessary, to insert a stack check to
@@ -219,6 +255,11 @@ impl FunctionStencil {
         self.layout.clear();
         self.srclocs.clear();
         self.debug_tags.clear();
+        self.nixe_observable_fp = false;
+        self.nixe_entries.clear();
+        self.nixe_entry_constraints.clear();
+        self.nixe_exit_costs.clear();
+        self.nixe_exit_compares.clear();
         self.stack_limit = None;
     }
 
@@ -420,6 +461,11 @@ impl Function {
                 srclocs: SecondaryMap::new(),
                 stack_limit: None,
                 debug_tags: DebugTags::default(),
+                nixe_observable_fp: false,
+                nixe_entries: alloc::vec::Vec::new(),
+                nixe_entry_constraints: alloc::collections::BTreeMap::new(),
+                nixe_exit_costs: alloc::collections::BTreeMap::new(),
+                nixe_exit_compares: alloc::collections::BTreeMap::new(),
             },
             params: FunctionParameters::new(),
         }

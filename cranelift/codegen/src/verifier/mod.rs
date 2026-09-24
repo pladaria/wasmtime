@@ -560,7 +560,10 @@ impl<'a> Verifier<'a> {
         }
 
         match self.func.dfg.insts[inst] {
-            MultiAry { ref args, .. } => {
+            NixeEntry { sig_ref, .. } => {
+                self.verify_sig_ref(inst, sig_ref, errors)?;
+            }
+            MultiAry { ref args, .. } | NixeBoundary { ref args, .. } => {
                 self.verify_value_list(inst, args, errors)?;
             }
             Jump { destination, .. } => {

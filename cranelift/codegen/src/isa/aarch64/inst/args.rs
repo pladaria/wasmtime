@@ -3,6 +3,31 @@
 use crate::ir::types::*;
 use crate::isa::aarch64::inst::*;
 
+/// Boxed only for this large pseudo-instruction; keep ordinary `Inst` compact.
+#[derive(Clone, Debug)]
+pub struct AtomicCAS128Args {
+    /// Select CASPAL instead of the validating exclusive loop.
+    pub lse: bool,
+    /// Memory/trap semantics shared by every access in the sequence.
+    pub flags: crate::ir::MemFlagsData,
+    /// Address, fixed to x6.
+    pub addr: Reg,
+    /// Expected low word, fixed to x0 (LSE) or x2 (loop).
+    pub expected_lo: Reg,
+    /// Expected high word, fixed to x1 (LSE) or x3 (loop).
+    pub expected_hi: Reg,
+    /// Replacement low word, fixed to x4.
+    pub replacement_lo: Reg,
+    /// Replacement high word, fixed to x5.
+    pub replacement_hi: Reg,
+    /// Observed low word, fixed to x0.
+    pub old_lo: Writable<Reg>,
+    /// Observed high word, fixed to x1.
+    pub old_hi: Writable<Reg>,
+    /// Exclusive-store status in x7, unused in the LSE form.
+    pub scratch: Writable<Reg>,
+}
+
 //=============================================================================
 // Instruction sub-components: shift and extend descriptors
 

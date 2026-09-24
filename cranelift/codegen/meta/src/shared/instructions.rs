@@ -19,6 +19,101 @@ fn define_control_flow(
 ) {
     ig.push(
         Inst::new(
+            "nixe_charge",
+            r#"
+        Subtract a completed block cost (1..=2048) from the reserved Nixe
+        poll register. Preserves condition flags and all SSA values. No check,
+        branch, state map, memory access or call. Requires the Nixe ABI; must
+        not occur inside a fault span.
+        "#,
+            &formats.unary_imm,
+        )
+        .operands_in(vec![Operand::new("imm", &imm.imm64)])
+        .other_side_effects(),
+    );
+    ig.push(
+        Inst::new(
+            "nixe_entry",
+            r#"
+        Define simultaneous physical inputs of a Nixe fast entry.
+
+        The signature has no parameters; its returns specify input value types,
+        not a system ABI. Final allocation chooses all input locations, including
+        spills, and exports them in nixe_states at this instruction's offset.
+        The caller builds canonical adapters and fast bridges to that contract.
+        This instruction must be first in an external entry and emits no bytes.
+        It is not a call and has no runtime selector or frame setup.
+        "#,
+            &formats.nixe_entry,
+        )
+        .operands_in(vec![
+            Operand::new("sig_ref", &entities.sig_ref),
+            Operand::new("imm", &imm.imm64),
+        ])
+        .operands_out(vec![Operand::new("values", &entities.varargs)])
+        .other_side_effects(),
+    );
+
+    for (name, terminal) in [
+        ("nixe_state", false),
+        ("nixe_check", false),
+        ("nixe_exit", true),
+        ("nixe_fault_start", false),
+        ("nixe_fault_end", false),
+    ] {
+        let instruction = Inst::new(
+            name,
+            r#"
+        Nixe native-boundary state in caller-defined operand order.
+
+        Keeps every operand live through final allocation and exports its
+        exact register or NativeFrame-relative spill location. The opaque
+        nonnegative ID must be unique in the compiled function. Requires
+        enable_nixe_abi on Linux x86-64 or AArch64.
+
+        nixe_state emits no bytes. Its map describes this point only, not a
+        subsequent instruction after allocator edits. nixe_exit terminates
+        the fragment in an aligned, fixed-size patch unit, initially trapping.
+        The owner must patch every exit to its fallback before publication.
+        Neither instruction implements guest semantics or a system-ABI call.
+
+        nixe_check tests the already-charged reserved poll counter. A positive
+        balance skips one aligned cold exit patch and continues in this SSA
+        block; otherwise execution enters that patch. Its state map describes
+        the cold patch; resumption is immediately after its patch_bytes. The
+        owner must preserve all live SSA values across its cold path and patch
+        it before execution. No work is charged and host flags are clobbered.
+
+        nixe_fault_start retains prefault operands through the matching
+        nixe_fault_end with the same ID and no operands, in one basic block.
+        These zero-byte delimiters surround ordinary CLIF memory operations;
+        each emitted fault instruction receives its own final allocation map.
+        They are memory-optimization barriers: accesses in different spans
+        are independent guest observations and cannot be merged or forwarded
+        across a delimiter. No hardware memory fence is emitted.
+        Spans cannot nest or contain control transfers or other Nixe boundaries.
+        They must contain at least one trapping memory operation; memory
+        operations marked notrap are rejected because they may move or lack
+        fault-PC metadata. Non-memory trapping operations are not supported.
+        The owner supplies only prefault values, never results defined inside
+        the span, and remains responsible for compound-access commit semantics.
+        "#,
+            &formats.nixe_boundary,
+        )
+        .operands_in(vec![
+            Operand::new("imm", &imm.imm64),
+            Operand::new("args", &entities.varargs),
+        ])
+        .other_side_effects();
+        ig.push(if terminal {
+            instruction.terminates_block()
+        } else {
+            instruction
+        });
+    }
+
+    ig.push(
+        Inst::new(
             "jump",
             r#"
         Jump.
@@ -1242,6 +1337,21 @@ pub(crate) fn define(
         )
         .operands_in(vec![Operand::new("GV", &entities.global_value)])
         .operands_out(vec![Operand::new("a", Mem).with_doc("Value loaded")]),
+    );
+
+    let arena_addr = &TypeVar::new(
+        "arena_addr",
+        "A 64-bit arena offset/address",
+        TypeSetBuilder::new().ints(64..64).build(),
+    );
+    ig.push(
+        Inst::new(
+            "nixe_arena_addr",
+            "Add a confined byte offset to the immutable pinned Nixe arena base. Requires the Nixe ABI; this instruction does not perform confinement.",
+            &formats.unary,
+        )
+        .operands_in(vec![Operand::new("offset", arena_addr)])
+        .operands_out(vec![Operand::new("addr", arena_addr)]),
     );
 
     // Note this instruction is marked as having other side-effects, so GVN won't try to hoist it,

@@ -45,6 +45,17 @@ pub fn eliminate_unreachable_code(
         // Remove all instructions from `block`.
         while let Some(inst) = pos.func.layout.first_inst(block) {
             trace!(" - {}", pos.func.dfg.display_inst(inst));
+            // Exit costs belong to instructions, not to historical boundary
+            // IDs. Egraph simplification can make a formerly live arm dead.
+            if let ir::InstructionData::NixeBoundary {
+                opcode: ir::Opcode::NixeExit,
+                imm,
+                ..
+            } = pos.func.dfg.insts[inst]
+            {
+                pos.func.nixe_exit_costs.remove(&(imm.bits() as u64));
+                pos.func.nixe_exit_compares.remove(&(imm.bits() as u64));
+            }
             pos.func.layout.remove_inst(inst);
         }
 

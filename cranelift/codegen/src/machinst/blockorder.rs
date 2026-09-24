@@ -70,6 +70,8 @@ use crate::{machinst::*, trace};
 /// Mapping from CLIF BBs to VCode BBs.
 #[derive(Debug)]
 pub struct BlockLoweringOrder {
+    nixe_root: Option<Block>,
+    nixe_entries: Vec<Block>,
     /// Lowered blocks, in BlockIndex order. Each block is some combination of
     /// (i) a CLIF block, and (ii) inserted crit-edge blocks before or after;
     /// see [LoweredBlock] for details.
@@ -165,6 +167,12 @@ impl BlockLoweringOrder {
         let mut indirect_branch_target_clif_blocks = FxHashSet::default();
 
         for block in f.layout.blocks() {
+            if f.layout
+                .first_inst(block)
+                .is_some_and(|inst| f.dfg.insts[inst].opcode() == Opcode::NixeEntry)
+            {
+                indirect_branch_target_clif_blocks.insert(block);
+            }
             let start = block_succs.len();
             visit_block_succs(f, block, |_, succ, from_table| {
                 block_out_count[block] += 1;
@@ -298,6 +306,8 @@ impl BlockLoweringOrder {
             }));
 
         let result = BlockLoweringOrder {
+            nixe_root: (!f.nixe_entries.is_empty()).then(|| f.layout.entry_block().unwrap()),
+            nixe_entries: f.nixe_entries.clone(),
             lowered_order,
             lowered_succ_indices,
             lowered_succ_ranges,
@@ -313,6 +323,19 @@ impl BlockLoweringOrder {
     /// Get the lowered order of blocks.
     pub fn lowered_order(&self) -> &[LoweredBlock] {
         &self.lowered_order[..]
+    }
+
+    /// Root and outgoing edge blocks used only for multi-entry analysis.
+    pub fn is_nixe_analysis_block(&self, block: BlockIndex) -> bool {
+        match (self.nixe_root, self.lowered_order[block.index()]) {
+            (Some(root), LoweredBlock::Orig { block }) => root == block,
+            (Some(root), LoweredBlock::CriticalEdge { pred, .. }) => root == pred,
+            _ => false,
+        }
+    }
+
+    pub fn nixe_entries(&self) -> &[Block] {
+        &self.nixe_entries
     }
 
     /// Get the BlockIndex, if any, for a given Block.
@@ -339,6 +362,9 @@ impl BlockLoweringOrder {
     /// target.
     pub fn is_indirect_branch_target(&self, block: BlockIndex) -> bool {
         self.indirect_branch_targets.contains(&block)
+            || self.lowered_order[block.index()]
+                .orig_block()
+                .is_some_and(|b| self.nixe_entries.contains(&b))
     }
 }
 

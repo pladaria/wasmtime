@@ -999,7 +999,7 @@ impl MachInstEmit for Inst {
 
                 if let Some(trap_code) = flags.trap_code() {
                     // Register the offset at which the actual load instruction starts.
-                    sink.add_trap(trap_code);
+                    sink.add_trap_with_size(trap_code, 4);
                 }
 
                 match &mem {
@@ -1132,7 +1132,7 @@ impl MachInstEmit for Inst {
 
                 if let Some(trap_code) = flags.trap_code() {
                     // Register the offset at which the actual store instruction starts.
-                    sink.add_trap(trap_code);
+                    sink.add_trap_with_size(trap_code, 4);
                 }
 
                 match &mem {
@@ -1207,7 +1207,7 @@ impl MachInstEmit for Inst {
                 let mem = mem.clone();
                 if let Some(trap_code) = flags.trap_code() {
                     // Register the offset at which the actual store instruction starts.
-                    sink.add_trap(trap_code);
+                    sink.add_trap_with_size(trap_code, 4);
                 }
                 match &mem {
                     &PairAMode::SignedOffset { reg, simm7 } => {
@@ -1237,7 +1237,7 @@ impl MachInstEmit for Inst {
                 let mem = mem.clone();
                 if let Some(trap_code) = flags.trap_code() {
                     // Register the offset at which the actual load instruction starts.
-                    sink.add_trap(trap_code);
+                    sink.add_trap_with_size(trap_code, 4);
                 }
 
                 match &mem {
@@ -1275,7 +1275,7 @@ impl MachInstEmit for Inst {
 
                 if let Some(trap_code) = flags.trap_code() {
                     // Register the offset at which the actual load instruction starts.
-                    sink.add_trap(trap_code);
+                    sink.add_trap_with_size(trap_code, 4);
                 }
 
                 let opc = match self {
@@ -1317,7 +1317,7 @@ impl MachInstEmit for Inst {
 
                 if let Some(trap_code) = flags.trap_code() {
                     // Register the offset at which the actual store instruction starts.
-                    sink.add_trap(trap_code);
+                    sink.add_trap_with_size(trap_code, 4);
                 }
 
                 let opc = match self {
@@ -1455,7 +1455,7 @@ impl MachInstEmit for Inst {
                 flags,
             } => {
                 if let Some(trap_code) = flags.trap_code() {
-                    sink.add_trap(trap_code);
+                    sink.add_trap_with_size(trap_code, 4);
                 }
 
                 sink.put4(enc_acq_rel(ty, op, rs, rt, rn));
@@ -1495,7 +1495,7 @@ impl MachInstEmit for Inst {
                 sink.bind_label(again_label, &mut state.ctrl_plane);
 
                 if let Some(trap_code) = flags.trap_code() {
-                    sink.add_trap(trap_code);
+                    sink.add_trap_with_size(trap_code, 4);
                 }
 
                 sink.put4(enc_ldaxr(ty, x27wr, x25)); // ldaxr x27, [x25]
@@ -1561,8 +1561,15 @@ impl MachInstEmit for Inst {
                             _ => unreachable!(),
                         };
 
-                        if sign_ext.is_some() {
-                            let (extendop, _) = sign_ext.unwrap();
+                        // Narrow CLIF operands may have arbitrary high bits.
+                        // Signed compares already extend from the access width;
+                        // unsigned min/max must ignore those bits as well.
+                        let compare_ext = sign_ext.map(|(op, _)| op).or_else(|| match ty {
+                            I8 => Some(ExtendOp::UXTB),
+                            I16 => Some(ExtendOp::UXTH),
+                            _ => None,
+                        });
+                        if let Some(extendop) = compare_ext {
                             Inst::AluRRRExtend {
                                 alu_op: ALUOp::SubS,
                                 size,
@@ -1619,7 +1626,7 @@ impl MachInstEmit for Inst {
                 }
 
                 if let Some(trap_code) = flags.trap_code() {
-                    sink.add_trap(trap_code);
+                    sink.add_trap_with_size(trap_code, 4);
                 }
                 if op == AtomicRMWLoopOp::Xchg {
                     sink.put4(enc_stlxr(ty, x24wr, x26, x25)); // stlxr w24, x26, [x25]
@@ -1655,7 +1662,7 @@ impl MachInstEmit for Inst {
                 };
 
                 if let Some(trap_code) = flags.trap_code() {
-                    sink.add_trap(trap_code);
+                    sink.add_trap_with_size(trap_code, 4);
                 }
 
                 sink.put4(enc_cas(size, rd, rt, rn));
@@ -1684,41 +1691,69 @@ impl MachInstEmit for Inst {
                 let x27wr = writable_xreg(27);
                 let again_label = sink.get_label();
                 let out_label = sink.get_label();
+                let mismatch_label = if emit_info.flags.enable_nixe_abi() {
+                    sink.get_label()
+                } else {
+                    out_label
+                };
 
                 // again:
                 sink.bind_label(again_label, &mut state.ctrl_plane);
 
                 if let Some(trap_code) = flags.trap_code() {
-                    sink.add_trap(trap_code);
+                    sink.add_trap_with_size(trap_code, 4);
                 }
 
                 // ldaxr x27, [x25]
                 sink.put4(enc_ldaxr(ty, x27wr, x25));
 
-                // The top 32-bits are zero-extended by the ldaxr so we don't
-                // have to use UXTW, just the x-form of the register.
+                // Subword expected operands need explicit zero extension.
+                // Word operands are compared at their declared 32-bit width.
                 let (bit21, extend_op) = match ty {
                     I8 => (0b1, 0b000000),
                     I16 => (0b1, 0b001000),
                     _ => (0b0, 0b000000),
                 };
-                let bits_31_21 = 0b111_01011_000 | bit21;
-                // cmp x27, x26 (== subs xzr, x27, x26)
+                // An I32 expected value can have undefined upper bits (for
+                // example after ireduce). Compare W registers in that case.
+                let bits_31_21 = (if ty == I32 {
+                    0b011_01011_000
+                } else {
+                    0b111_01011_000
+                }) | bit21;
+                // cmp x/w27, x/w26 (subword forms extend the expected value).
                 sink.put4(enc_arith_rrr(bits_31_21, extend_op, xzrwr, x27, x26));
 
-                // b.ne out
+                // Nixe emulates architectural CAS, including write permission
+                // checks on mismatch. Arm permits atomically writing back the
+                // observed value. Keep the ordinary CLIF sequence unchanged.
+                // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85#page=92
+                // b.ne mismatch (Nixe) / out (ordinary ABI).
                 let br_out_offset = sink.cur_offset();
                 sink.put4(enc_conditional_br(
-                    BranchTarget::Label(out_label),
+                    BranchTarget::Label(mismatch_label),
                     CondBrKind::Cond(Cond::Ne),
                 ));
-                sink.use_label_at_offset(br_out_offset, out_label, LabelUse::Branch19);
+                sink.use_label_at_offset(br_out_offset, mismatch_label, LabelUse::Branch19);
 
                 if let Some(trap_code) = flags.trap_code() {
-                    sink.add_trap(trap_code);
+                    sink.add_trap_with_size(trap_code, 4);
                 }
 
                 sink.put4(enc_stlxr(ty, x24wr, x28, x25)); // stlxr w24, x28, [x25]
+
+                if emit_info.flags.enable_nixe_abi() {
+                    let status_label = sink.get_label();
+                    sink.use_label_at_offset(sink.cur_offset(), status_label, LabelUse::Branch26);
+                    sink.put4(enc_jump26(0b000101, 0));
+                    sink.bind_label(mismatch_label, &mut state.ctrl_plane);
+                    if let Some(trap_code) = flags.trap_code() {
+                        sink.add_trap_with_size(trap_code, 4);
+                    }
+                    // No extra scratch or eager guest-state save is needed.
+                    sink.put4(enc_stlxr(ty, x24wr, x27, x25));
+                    sink.bind_label(status_label, &mut state.ctrl_plane);
+                }
 
                 // cbnz w24, again.
                 // Note, we're actually testing x24, and relying on the default zero-high-half
@@ -1733,6 +1768,55 @@ impl MachInstEmit for Inst {
                 // out:
                 sink.bind_label(out_label, &mut state.ctrl_plane);
             }
+            Inst::AtomicCAS128 { data } => {
+                let lse = data.lse;
+                let flags = data.flags;
+                // Pair register constraints are enforced in get_operands.
+                // CASP returns an atomic observation of BOTH words, including
+                // on mismatch. LDAXP alone does not provide that guarantee:
+                // validate it by successfully storing the observed pair back.
+                // https://documentation-service.arm.com/static/67e40f3398aa3c3b6eea6a85#page=103
+                if let Some(trap) = flags.trap_code() {
+                    sink.add_trap_with_size(trap, 4);
+                }
+                if lse {
+                    sink.put4(0x4860_fcc4); // caspal x0,x1,x4,x5,[x6]
+                } else {
+                    let again = sink.get_label();
+                    let mismatch = sink.get_label();
+                    let status = sink.get_label();
+                    sink.bind_label(again, &mut state.ctrl_plane);
+                    sink.put4(0xc87f_84c0); // ldaxp x0,x1,[x6]
+                    for cmp in [0xeb02_001f, 0xeb03_003f] {
+                        // cmp x0,x2; cmp x1,x3
+                        sink.put4(cmp);
+                        let offset = sink.cur_offset();
+                        sink.put4(enc_conditional_br(
+                            BranchTarget::Label(mismatch),
+                            CondBrKind::Cond(Cond::Ne),
+                        ));
+                        sink.use_label_at_offset(offset, mismatch, LabelUse::Branch19);
+                    }
+                    if let Some(trap) = flags.trap_code() {
+                        sink.add_trap_with_size(trap, 4);
+                    }
+                    sink.put4(0xc827_94c4); // stlxp w7,x4,x5,[x6]
+                    sink.use_label_at_offset(sink.cur_offset(), status, LabelUse::Branch26);
+                    sink.put4(enc_jump26(0b000101, 0));
+                    sink.bind_label(mismatch, &mut state.ctrl_plane);
+                    if let Some(trap) = flags.trap_code() {
+                        sink.add_trap_with_size(trap, 4);
+                    }
+                    sink.put4(0xc827_84c0); // stlxp w7,x0,x1,[x6]
+                    sink.bind_label(status, &mut state.ctrl_plane);
+                    let offset = sink.cur_offset();
+                    sink.put4(enc_conditional_br(
+                        BranchTarget::Label(again),
+                        CondBrKind::NotZero(xreg(7), OperandSize::Size32),
+                    ));
+                    sink.use_label_at_offset(offset, again, LabelUse::Branch19);
+                }
+            }
             &Inst::LoadAcquire {
                 access_ty,
                 rt,
@@ -1740,7 +1824,7 @@ impl MachInstEmit for Inst {
                 flags,
             } => {
                 if let Some(trap_code) = flags.trap_code() {
-                    sink.add_trap(trap_code);
+                    sink.add_trap_with_size(trap_code, 4);
                 }
 
                 sink.put4(enc_ldar(access_ty, rt, rn));
@@ -1752,7 +1836,7 @@ impl MachInstEmit for Inst {
                 flags,
             } => {
                 if let Some(trap_code) = flags.trap_code() {
-                    sink.add_trap(trap_code);
+                    sink.add_trap_with_size(trap_code, 4);
                 }
 
                 sink.put4(enc_stlr(access_ty, rt, rn));
@@ -2820,7 +2904,7 @@ impl MachInstEmit for Inst {
 
                 if let Some(trap_code) = flags.trap_code() {
                     // Register the offset at which the actual load instruction starts.
-                    sink.add_trap(trap_code);
+                    sink.add_trap_with_size(trap_code, 4);
                 }
 
                 sink.put4(enc_ldst_vec(q, size, rn, rd));
@@ -3146,7 +3230,7 @@ impl MachInstEmit for Inst {
                 sink.put4(0xd43e0000);
             }
             &Inst::Udf { trap_code } => {
-                sink.add_trap(trap_code);
+                sink.add_trap_with_size(trap_code, 4);
                 sink.put_data(Inst::TRAP_OPCODE);
             }
             &Inst::Adr { rd, off } => {
@@ -3571,6 +3655,59 @@ impl MachInstEmit for Inst {
 
             &Inst::SequencePoint { .. } => {
                 // Nothing.
+            }
+            Inst::NixeArenaAddr { offset, dst } => {
+                sink.put4(enc_arith_rrr(0b10001011_000, 0, *dst, xreg(19), *offset));
+            }
+            Inst::NixeBoundary { data } => {
+                if let Some((lhs, rhs, ty)) = data.comparison() {
+                    // Fused CMP + patch: allocator edits and poll arithmetic
+                    // precede the flag producer on both paths. C is not-borrow.
+                    // https://developer.arm.com/documentation/ddi0602/2025-12/Base-Instructions/CMP--shifted-register---Compare--shifted-register---an-alias-of-SUBS--shifted-register--
+                    let lhs = u32::from(lhs.to_real_reg().unwrap().hw_enc());
+                    let rhs = u32::from(rhs.to_real_reg().unwrap().hw_enc());
+                    let compare = if ty.bits() == 64 {
+                        0xeb00001f
+                    } else {
+                        0x6b00001f
+                    } | (rhs << 16)
+                        | (lhs << 5);
+                    if let Some(cost) = data.poll_cost {
+                        sink.put4(0xf1000294 | (u32::from(cost) << 10));
+                        sink.put4(0x5400006d); // B.LE over CMP + hot patch
+                    }
+                    sink.put4(compare);
+                    data.record(sink, state.frame_layout(), 4);
+                    sink.put4(0xd4200000);
+                    if data.poll_cost.is_some() {
+                        sink.put4(compare);
+                        sink.put4(0xd4200000);
+                    }
+                } else if let Some(cost) = data.charge {
+                    // SUB (not SUBS) x20,x20,#cost: preserve NZCV.
+                    sink.put4(0xd1000294 | (u32::from(cost) << 10));
+                } else if data.check {
+                    // CMP x20,#0; B.GT over the cold patch.
+                    sink.put4(0xf100029f);
+                    sink.put4(0x5400004c);
+                    data.record(sink, state.frame_layout(), 4);
+                    sink.put4(0xd4200000);
+                } else {
+                    if let Some(cost) = data.poll_cost {
+                        // SUBS x20,x20,#cost; B.LE over the hot patch. All mapped
+                        // SSA operands survive; NZCV is not an implicit operand.
+                        sink.put4(0xf1000294 | (u32::from(cost) << 10));
+                        sink.put4(0x5400004d);
+                    }
+                    data.record(sink, state.frame_layout(), 4);
+                    if data.exit {
+                        // Unpublished exit. Its owner installs b imm26.
+                        sink.put4(0xd4200000); // brk #0
+                        if data.poll_cost.is_some() {
+                            sink.put4(0xd4200000);
+                        }
+                    }
+                }
             }
 
             &Inst::StackProbeLoop { start, end, step } => {

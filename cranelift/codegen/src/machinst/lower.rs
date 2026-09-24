@@ -717,6 +717,15 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         ctrl_plane: &mut ControlPlane,
     ) -> CodegenResult<()> {
         self.cur_scan_entry_color = Some(self.block_end_colors[block]);
+        let mut nixe_fault = None;
+        // Pairs were validated in source order. Pop their starts in reverse
+        // order instead of rescanning the block for every memory operation.
+        let mut nixe_fault_starts = Vec::new();
+        if self.flags.enable_nixe_abi() {
+            nixe_fault_starts.extend(self.f.layout.block_insts(block).filter(|&inst| {
+                self.f.dfg.insts[inst].opcode() == crate::ir::Opcode::NixeFaultStart
+            }));
+        }
         // Lowering loop:
         // - For each non-branch instruction, in reverse order:
         //   - If side-effecting (load, store, branch/call/return,
@@ -765,6 +774,22 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             self.cur_inst = Some(inst);
             if has_side_effect {
                 self.cur_scan_entry_color = Some(entry_color);
+            }
+
+            // Fault delimiters bracket ordinary lowering. Their state operands
+            // become real uses at each fallible memory instruction. Compound
+            // ops require late uses to protect against internal definitions.
+            match self.f.dfg.insts[inst].opcode() {
+                crate::ir::Opcode::NixeFaultEnd => {
+                    let start = nixe_fault_starts.pop().expect("validated Nixe fault pair");
+                    nixe_fault = Some(crate::nixe::Boundary::lower(self, start).unwrap().0);
+                    continue;
+                }
+                crate::ir::Opcode::NixeFaultStart => {
+                    nixe_fault = None;
+                    continue;
+                }
+                _ => {}
             }
 
             // Skip lowering branches; these are handled separately
@@ -825,6 +850,19 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             let start = self.vcode.vcode.num_insts();
             let loc = self.srcloc(inst);
             self.finish_ir_inst(loc);
+
+            if let Some(fault) = &nixe_fault {
+                for index in start..self.vcode.vcode.num_insts() {
+                    let inst = &self.vcode.vcode[InsnIndex::new(index)];
+                    let state = inst.nixe_fault_operand_pos().map(|pos| {
+                        let mut state = (**fault).clone();
+                        state.fault_pos = pos;
+                        state
+                    });
+                    self.vcode
+                        .add_nixe_fault(BackwardsInsnIndex::new(index), state);
+                }
+            }
 
             // If the instruction had a user stack map, forward it from the CLIF
             // to the vcode.
@@ -1214,6 +1252,18 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         }
     }
 
+    /// Whether a result has a consumer in the machine code already lowered
+    /// backwards from this definition. Nixe ingress need not initialize results
+    /// eliminated by instruction selection, even without an IR DCE pass.
+    pub(crate) fn nixe_result_is_used(&self, inst: Inst, index: usize) -> bool {
+        self.value_lowered_uses[self.f.dfg.inst_results(inst)[index]] != 0
+    }
+
+    /// Whether the caller owns a dynamically controlled, observable FP environment.
+    pub(crate) fn nixe_observable_fp(&self) -> bool {
+        self.f.nixe_observable_fp
+    }
+
     pub fn block_successor_label(&self, block: Block, succ: usize) -> MachLabel {
         trace!("block_successor_label: block {block} succ {succ}");
         let lowered = self
@@ -1364,6 +1414,17 @@ fn is_value_use_root(f: &Function, inst: Inst) -> bool {
 impl<'func, I: VCodeInst> Lower<'func, I> {
     pub fn dfg(&self) -> &DataFlowGraph {
         &self.f.dfg
+    }
+
+    /// The ordinary ISLE Value -> Inst extractor does not use the sinking
+    /// query. Keep observable FP opaque there as well, so consumer patterns
+    /// cannot introduce additional FP effects while the producer stays live.
+    pub(crate) fn value_def_for_pattern(&self, value: Value) -> Option<Inst> {
+        self.f
+            .dfg
+            .value_def(value)
+            .inst()
+            .filter(|&inst| !crate::inst_predicates::has_observable_fp_effect(self.f, inst))
     }
 
     /// Get the `Callee`.
@@ -1564,7 +1625,13 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
                 let src_side_effect = src_entry_color.get() != 0;
                 trace!(" -> src inst {}", self.f.dfg.display_inst(src_inst));
                 trace!(" -> has lowering side effect: {}", src_side_effect);
-                if is_value_use_root(self.f, src_inst) {
+                if crate::inst_predicates::has_observable_fp_effect(self.f, src_inst) {
+                    // Do not absorb FP operations into consumer patterns even
+                    // when adjacent. Those patterns assume only value semantics
+                    // (e.g. compare/select -> min); status must happen exactly
+                    // once with the original operation and control environment.
+                    InputSourceInst::None
+                } else if is_value_use_root(self.f, src_inst) {
                     // If this instruction is a "root instruction" then it's
                     // required that we can't look through it to see the
                     // definition. This means that the `ValueUseState` for the

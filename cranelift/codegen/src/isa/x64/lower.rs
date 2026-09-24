@@ -320,6 +320,10 @@ impl LowerBackend for X64Backend {
     type MInst = Inst;
 
     fn lower(&self, ctx: &mut Lower<Inst>, ir_inst: IRInst) -> Option<InstOutput> {
+        if let Some((data, outputs)) = crate::nixe::Boundary::lower(ctx, ir_inst) {
+            ctx.emit(Inst::NixeBoundary { data });
+            return Some(outputs);
+        }
         isle::lower(ctx, self, ir_inst)
     }
 

@@ -208,6 +208,11 @@ macro_rules! isle_lower_prelude_methods {
         }
 
         #[inline]
+        fn def_inst(&mut self, val: Value) -> Option<Inst> {
+            self.lower_ctx.value_def_for_pattern(val)
+        }
+
+        #[inline]
         fn i64_from_iconst(&mut self, val: Value) -> Option<i64> {
             let inst = self.def_inst(val)?;
             let constant = match self.lower_ctx.data(inst) {

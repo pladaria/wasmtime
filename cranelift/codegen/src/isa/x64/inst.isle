@@ -315,6 +315,9 @@
 
        ;; A pseudoinstruction that serves as a sequence point.
        (SequencePoint)
+       (NixeEndbr64)
+       (NixeArenaAddr (offset Gpr) (dst WritableGpr))
+       (NixeBoundary (data BoxNixeBoundary))
 
        ;; An instruction assembled outside of cranelift-codegen.
        (External (inst AssemblerInst))))
@@ -328,6 +331,7 @@
             Size64))
 
 (type BoxCallInfo extern (enum))
+(type BoxNixeBoundary extern (enum))
 (type BoxCallIndInfo extern (enum))
 (type BoxReturnCallInfo extern (enum))
 (type BoxReturnCallIndInfo extern (enum))
@@ -1311,6 +1315,9 @@
 
 (decl pure use_fma () bool)
 (extern constructor use_fma use_fma)
+
+(decl pure nixe_observable_fp () bool)
+(extern constructor nixe_observable_fp nixe_observable_fp)
 
 (decl pure use_avx_vnni () bool)
 (extern constructor use_avx_vnni use_avx_vnni)

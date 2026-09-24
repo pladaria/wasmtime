@@ -72,6 +72,36 @@ pub trait FuncWriter {
             )?;
         }
 
+        if func.nixe_observable_fp {
+            any = true;
+            writeln!(w, "    nixe_observable_fp")?;
+        }
+
+        for (id, constraints) in &func.nixe_entry_constraints {
+            any = true;
+            write!(w, "    nixe_inputs {id} = [")?;
+            for (i, constraint) in constraints.iter().enumerate() {
+                if i != 0 {
+                    write!(w, ", ")?;
+                }
+                write!(w, "{constraint}")?;
+            }
+            writeln!(w, "]")?;
+        }
+
+        for (id, cost) in &func.nixe_exit_costs {
+            any = true;
+            writeln!(w, "    nixe_poll {id} = {cost}")?;
+        }
+        for (id, compare) in &func.nixe_exit_compares {
+            any = true;
+            writeln!(
+                w,
+                "    ; nixe_exit_compare {id}: {}, {}",
+                compare.lhs, compare.rhs
+            )?;
+        }
+
         // Write out all signatures before functions since function declarations can refer to
         // signatures.
         for (sig, sig_data) in &func.dfg.signatures {
@@ -394,6 +424,7 @@ pub fn write_operands(w: &mut dyn Write, dfg: &DataFlowGraph, inst: Inst) -> fmt
     use crate::ir::instructions::InstructionData::*;
     let ctrl_ty = dfg.ctrl_typevar(inst);
     match dfg.insts[inst] {
+        NixeEntry { sig_ref, imm, .. } => write!(w, " {sig_ref}, {imm}"),
         AtomicRmw { op, args, .. } => write!(w, " {} {}, {}", op, args[0], args[1]),
         AtomicCas { args, .. } => write!(w, " {}, {}, {}", args[0], args[1], args[2]),
         LoadNoOffset { flags, arg, .. } => write!(w, "{} {arg}", dfg.mem_flags[flags]),
@@ -424,6 +455,13 @@ pub fn write_operands(w: &mut dyn Write, dfg: &DataFlowGraph, inst: Inst) -> fmt
             } else {
                 write!(w, " {}", DisplayValues(args.as_slice(pool)))
             }
+        }
+        NixeBoundary { imm, ref args, .. } => {
+            write!(w, " {imm}")?;
+            if !args.is_empty() {
+                write!(w, ", {}", DisplayValues(args.as_slice(pool)))?;
+            }
+            Ok(())
         }
         NullAry { .. } => write!(w, " "),
         TernaryImm8 { imm, args, .. } => write!(w, " {}, {}, {}", args[0], args[1], imm),

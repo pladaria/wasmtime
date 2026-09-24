@@ -2,6 +2,40 @@
 use crate::ir::immediates::Offset32;
 use crate::ir::{self, Block, DataFlowGraph, Function, Inst, InstructionData, Opcode, Type, Value};
 
+/// Operations whose native FP environment is observable in Nixe functions.
+/// Keep this list shared by optimization and instruction selection. Constants,
+/// bitcasts, register moves and sign-bit operations do not access FP control or
+/// status and must remain freely optimizable.
+pub(crate) fn has_observable_fp_effect(func: &Function, inst: Inst) -> bool {
+    use Opcode::*;
+    func.nixe_observable_fp
+        && matches!(
+            func.dfg.insts[inst].opcode(),
+            Fcmp | Fadd
+                | Fsub
+                | Fmul
+                | Fdiv
+                | Sqrt
+                | Fma
+                | Fmin
+                | Fmax
+                | Ceil
+                | Floor
+                | Trunc
+                | Nearest
+                | Fpromote
+                | Fdemote
+                | Fvdemote
+                | FvpromoteLow
+                | FcvtToUint
+                | FcvtToSint
+                | FcvtToUintSat
+                | FcvtToSintSat
+                | FcvtFromUint
+                | FcvtFromSint
+        )
+}
+
 /// Test whether the given opcode is unsafe to even consider as side-effect-free.
 #[inline(always)]
 fn trivially_has_side_effects(opcode: Opcode) -> bool {
@@ -38,7 +72,9 @@ fn is_load_with_defined_trapping(
 fn has_side_effect(func: &Function, inst: Inst) -> bool {
     let data = &func.dfg.insts[inst];
     let opcode = data.opcode();
-    trivially_has_side_effects(opcode) || is_load_with_defined_trapping(opcode, data, &func.dfg)
+    trivially_has_side_effects(opcode)
+        || has_observable_fp_effect(func, inst)
+        || is_load_with_defined_trapping(opcode, data, &func.dfg)
 }
 
 /// Does the given instruction behave as a "pure" node with respect to
@@ -71,7 +107,9 @@ pub fn is_pure_for_egraph(func: &Function, inst: Inst) -> bool {
 
     let op = func.dfg.insts[inst].opcode();
 
-    has_one_result && (is_pure_load || (!op.can_load() && !trivially_has_side_effects(op)))
+    has_one_result
+        && !has_observable_fp_effect(func, inst)
+        && (is_pure_load || (!op.can_load() && !trivially_has_side_effects(op)))
 }
 
 /// Can the given instruction be merged into another copy of itself?
@@ -84,6 +122,7 @@ pub fn is_mergeable_for_egraph(func: &Function, inst: Inst) -> bool {
     // We can only merge zero- and one-result operators due to the way that GVN
     // is structured in the egraph implementation.
     func.dfg.inst_results(inst).len() <= 1
+        && !has_observable_fp_effect(func, inst)
         // Loads/stores are handled by alias analysis and not
         // otherwise mergeable.
         && !op.can_load()

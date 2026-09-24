@@ -103,6 +103,13 @@ where
                     continue;
                 }
                 ValueDef::Result(inst, _) if ctx.ctx.func.dfg.inst_results(inst).len() == 1 => {
+                    // An opaque FP producer must not be looked through by a
+                    // pure consumer either (e.g. fneg(fsub(a, b))). A rewrite
+                    // could introduce another FP operation, with different
+                    // rounding or additional status effects.
+                    if crate::inst_predicates::has_observable_fp_effect(ctx.ctx.func, inst) {
+                        continue;
+                    }
                     // Charge one unit of fuel per yielded match. When
                     // fuel is exhausted, terminate iteration early:
                     // returning no matches is always semantically valid
@@ -200,6 +207,13 @@ where
 
 impl<'a, 'b, 'c> generated_code::Context for IsleContext<'a, 'b, 'c> {
     isle_common_prelude_methods!();
+
+    fn def_inst(&mut self, val: Value) -> Option<crate::ir::Inst> {
+        self.dfg()
+            .value_def(val)
+            .inst()
+            .filter(|&inst| !crate::inst_predicates::has_observable_fp_effect(self.ctx.func, inst))
+    }
 
     type inst_data_value_etor_returns = InstDataEtorIter<'a, 'b, 'c>;
 

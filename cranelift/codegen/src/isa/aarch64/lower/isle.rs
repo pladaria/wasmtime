@@ -24,8 +24,8 @@ use crate::{
         ValueList, immediates::*, types::*,
     },
     isa::aarch64::abi::AArch64MachineDeps,
-    isa::aarch64::inst::SImm7Scaled,
     isa::aarch64::inst::args::{ShiftOp, ShiftOpShiftImm},
+    isa::aarch64::inst::{AMode, SImm7Scaled, xreg},
     machinst::{
         CallArgList, CallRetList, InstOutput, MachInst, VCodeConstant, VCodeConstantData,
         abi::ArgPair, ty_bits,
@@ -36,6 +36,8 @@ use alloc::vec::Vec;
 use core::u32;
 use regalloc2::PReg;
 
+type BoxNixeBoundary = Box<crate::nixe::Boundary>;
+type BoxAtomicCAS128Args = Box<crate::isa::aarch64::inst::args::AtomicCAS128Args>;
 type BoxCallInfo = Box<CallInfo<ExternalName>>;
 type BoxCallIndInfo = Box<CallInfo<Reg>>;
 type BoxReturnCallInfo = Box<ReturnCallInfo<ExternalName>>;
@@ -74,6 +76,44 @@ pub struct ExtendedValue {
 }
 
 impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
+    fn atomic_cas128_args(
+        &mut self,
+        lse: bool,
+        flags: MemFlagsData,
+        addr: Reg,
+        expected_lo: Reg,
+        expected_hi: Reg,
+        replacement_lo: Reg,
+        replacement_hi: Reg,
+        old_lo: Writable<Reg>,
+        old_hi: Writable<Reg>,
+        scratch: Writable<Reg>,
+    ) -> BoxAtomicCAS128Args {
+        Box::new(crate::isa::aarch64::inst::args::AtomicCAS128Args {
+            lse,
+            flags,
+            addr,
+            expected_lo,
+            expected_hi,
+            replacement_lo,
+            replacement_hi,
+            old_lo,
+            old_hi,
+            scratch,
+        })
+    }
+    fn abi_slot_amode(&mut self, offset: i32) -> AMode {
+        if self.backend.flags.enable_nixe_abi() {
+            AMode::RegOffset {
+                rn: xreg(21),
+                off: i64::from(offset) + i64::from(crate::nixe::TRANSFER_BYTES),
+            }
+        } else {
+            AMode::SlotOffset {
+                off: i64::from(offset),
+            }
+        }
+    }
     isle_lower_prelude_methods!();
 
     fn gen_call_info(

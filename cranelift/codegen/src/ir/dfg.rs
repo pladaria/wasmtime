@@ -1125,10 +1125,20 @@ impl DataFlowGraph {
         }
     }
 
+    // Nixe entry signatures describe simultaneous physical definitions, not a
+    // call. Keep call_signature/analyze_call unchanged for all ABI consumers.
+    fn result_signature(&self, inst: Inst) -> Option<SigRef> {
+        if let ir::InstructionData::NixeEntry { sig_ref, .. } = self.insts[inst] {
+            Some(sig_ref)
+        } else {
+            self.non_tail_call_or_try_call_signature(inst)
+        }
+    }
+
     // Only for use by the verifier. Everyone else should just use
     // `dfg.inst_results(inst).len()`.
     pub(crate) fn num_expected_results_for_verifier(&self, inst: Inst) -> usize {
-        match self.non_tail_call_or_try_call_signature(inst) {
+        match self.result_signature(inst) {
             Some(sig) => self.signatures[sig].returns.len(),
             None => {
                 let constraints = self.insts[inst].opcode().constraints();
@@ -1143,7 +1153,7 @@ impl DataFlowGraph {
         inst: Inst,
         ctrl_typevar: Type,
     ) -> impl iter::ExactSizeIterator<Item = Type> + 'a {
-        return match self.non_tail_call_or_try_call_signature(inst) {
+        return match self.result_signature(inst) {
             Some(sig) => InstResultTypes::Signature(self, sig, 0),
             None => {
                 let constraints = self.insts[inst].opcode().constraints();

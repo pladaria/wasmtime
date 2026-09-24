@@ -109,7 +109,10 @@ impl Inst {
             | Inst::Unwind { .. }
             | Inst::DummyUse { .. }
             | Inst::LabelAddress { .. }
-            | Inst::SequencePoint => true,
+            | Inst::SequencePoint
+            | Inst::NixeEndbr64
+            | Inst::NixeArenaAddr { .. }
+            | Inst::NixeBoundary { .. } => true,
 
             Inst::Atomic128RmwSeq { .. } | Inst::Atomic128XchgSeq { .. } => emit_info.cmpxchg16b(),
 
@@ -840,6 +843,9 @@ impl PrettyPrint for Inst {
             Inst::SequencePoint {} => {
                 format!("sequence_point")
             }
+            Inst::NixeBoundary { data } => format!("nixe_boundary {data:?}"),
+            Inst::NixeArenaAddr { offset, dst } => format!("nixe_arena_addr {offset:?}, {dst:?}"),
+            Inst::NixeEndbr64 => format!("endbr64"),
 
             Inst::External { inst } => {
                 format!("{inst}")
@@ -1104,7 +1110,11 @@ fn x64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
             ..
         } => {
             collector.reg_late_use(operand);
-            collector.reg_early_def(temp);
+            // Every input is a late use, so late defs cannot overlap any
+            // input (including attached prefault operands). Keep both defs
+            // in the same phase; mixing an early temp with a late fixed RAX
+            // makes fastalloc overestimate availability for late Any uses.
+            collector.reg_def(temp);
             // This `fixed_def` is needed because `CMPXCHG` always uses this
             // register implicitly.
             collector.reg_fixed_def(dst_old, regs::rax());
@@ -1211,7 +1221,13 @@ fn x64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
             collector.reg_def(dst);
         }
 
-        Inst::SequencePoint { .. } => {}
+        Inst::SequencePoint { .. } | Inst::NixeEndbr64 => {}
+        Inst::NixeBoundary { data } => data.operands(collector),
+        Inst::NixeArenaAddr { offset, dst } => {
+            collector.reg_use(offset);
+            collector.reg_def(dst);
+            collector.reg_fixed_nonallocatable(regs::r13().to_real_reg().unwrap().into());
+        }
 
         Inst::External { inst } => {
             inst.visit(&mut external::RegallocVisitor { collector });
@@ -1297,6 +1313,7 @@ impl MachInst for Inst {
 
     fn is_trap(&self) -> bool {
         match self {
+            Self::NixeBoundary { data } => data.exit,
             Self::External {
                 inst: asm::inst::Inst::ud2_zo(..),
             } => true,
@@ -1309,6 +1326,10 @@ impl MachInst for Inst {
             Self::Args { .. } => true,
             _ => false,
         }
+    }
+
+    fn is_nixe_entry(&self) -> bool {
+        matches!(self, Self::NixeBoundary { data } if data.entry)
     }
 
     fn call_type(&self) -> CallType {
@@ -1353,6 +1374,18 @@ impl MachInst for Inst {
 
     fn is_mem_access(&self) -> bool {
         panic!("TODO FILL ME OUT")
+    }
+
+    fn nixe_fault_operand_pos(&self) -> Option<regalloc2::OperandPos> {
+        match self {
+            Self::External { inst } => inst.memory_trap().map(|_| regalloc2::OperandPos::Early),
+            // Compound memory sequences carry their flags in their amodes.
+            // Conservatively retain operands even for trusted addresses here.
+            Self::AtomicRmwSeq { .. }
+            | Self::Atomic128RmwSeq { .. }
+            | Self::Atomic128XchgSeq { .. } => Some(regalloc2::OperandPos::Late),
+            _ => None,
+        }
     }
 
     fn gen_move(dst_reg: Writable<Reg>, src_reg: Reg, ty: Type) -> Inst {
@@ -1460,7 +1493,14 @@ impl MachInst for Inst {
     }
 
     fn worst_case_size() -> CodeOffset {
-        15
+        // A checked Nixe comparison terminal includes up to seven alignment
+        // bytes, SUB/JLE (9), CMP (3), hot patch (8), CMP/padding (8), cold
+        // patch (8). Keep island checks valid for this indivisible producer.
+        43
+    }
+
+    fn gen_block_start(indirect: bool, cfi: bool) -> Option<Self> {
+        (indirect && cfi).then_some(Self::NixeEndbr64)
     }
 
     fn worst_case_island_growth() -> CodeOffset {

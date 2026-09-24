@@ -502,6 +502,30 @@ fn aarch64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
             collector.reg_fixed_def(oldval, xreg(27));
             collector.reg_fixed_def(scratch, xreg(24));
         }
+        Inst::AtomicCAS128 { data } => {
+            let args::AtomicCAS128Args {
+                lse,
+                addr,
+                expected_lo,
+                expected_hi,
+                replacement_lo,
+                replacement_hi,
+                old_lo,
+                old_hi,
+                scratch,
+                ..
+            } = &mut **data;
+            collector.reg_fixed_use(addr, xreg(6));
+            collector.reg_fixed_use(expected_lo, xreg(if *lse { 0 } else { 2 }));
+            collector.reg_fixed_use(expected_hi, xreg(if *lse { 1 } else { 3 }));
+            collector.reg_fixed_use(replacement_lo, xreg(4));
+            collector.reg_fixed_use(replacement_hi, xreg(5));
+            collector.reg_fixed_def(old_lo, xreg(0));
+            collector.reg_fixed_def(old_hi, xreg(1));
+            if !*lse {
+                collector.reg_fixed_def(scratch, xreg(7));
+            }
+        }
         Inst::LoadAcquire { rt, rn, .. } => {
             collector.reg_use(rn);
             collector.reg_def(rt);
@@ -922,6 +946,12 @@ fn aarch64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
             collector.reg_def(dst);
         }
         Inst::SequencePoint { .. } => {}
+        Inst::NixeBoundary { data } => data.operands(collector),
+        Inst::NixeArenaAddr { offset, dst } => {
+            collector.reg_use(offset);
+            collector.reg_def(dst);
+            collector.reg_fixed_nonallocatable(xreg_preg(19));
+        }
         Inst::StackProbeLoop { start, end, .. } => {
             collector.reg_early_def(start);
             collector.reg_use(end);
@@ -994,6 +1024,7 @@ impl MachInst for Inst {
 
     fn is_trap(&self) -> bool {
         match self {
+            Self::NixeBoundary { data } => data.exit,
             Self::Udf { .. } => true,
             _ => false,
         }
@@ -1004,6 +1035,10 @@ impl MachInst for Inst {
             Self::Args { .. } => true,
             _ => false,
         }
+    }
+
+    fn is_nixe_entry(&self) -> bool {
+        matches!(self, Self::NixeBoundary { data } if data.entry)
     }
 
     fn call_type(&self) -> CallType {
@@ -1062,6 +1097,63 @@ impl MachInst for Inst {
             // TODO: verify this carefully
             _ => false,
         }
+    }
+
+    fn nixe_fault_operand_pos(&self) -> Option<regalloc2::OperandPos> {
+        let flags = match self {
+            Self::ULoad8 { flags, .. }
+            | Self::SLoad8 { flags, .. }
+            | Self::ULoad16 { flags, .. }
+            | Self::SLoad16 { flags, .. }
+            | Self::ULoad32 { flags, .. }
+            | Self::SLoad32 { flags, .. }
+            | Self::ULoad64 { flags, .. }
+            | Self::LoadP64 { flags, .. }
+            | Self::Store8 { flags, .. }
+            | Self::Store16 { flags, .. }
+            | Self::Store32 { flags, .. }
+            | Self::Store64 { flags, .. }
+            | Self::StoreP64 { flags, .. }
+            | Self::FpuLoad16 { flags, .. }
+            | Self::FpuStore16 { flags, .. }
+            | Self::FpuLoad32 { flags, .. }
+            | Self::FpuStore32 { flags, .. }
+            | Self::FpuLoad64 { flags, .. }
+            | Self::FpuStore64 { flags, .. }
+            | Self::FpuLoad128 { flags, .. }
+            | Self::FpuStore128 { flags, .. }
+            | Self::FpuLoadP64 { flags, .. }
+            | Self::FpuStoreP64 { flags, .. }
+            | Self::FpuLoadP128 { flags, .. }
+            | Self::FpuStoreP128 { flags, .. }
+            | Self::AtomicRMWLoop { flags, .. }
+            | Self::AtomicCASLoop { flags, .. }
+            | Self::AtomicRMW { flags, .. }
+            | Self::AtomicCAS { flags, .. }
+            | Self::LoadAcquire { flags, .. }
+            | Self::StoreRelease { flags, .. }
+            | Self::VecLoadReplicate { flags, .. } => flags,
+            Self::AtomicCAS128 { data } => &data.flags,
+            _ => return None,
+        };
+        flags.trap_code()?;
+        Some(
+            if matches!(
+                self,
+                Self::AtomicRMWLoop { .. }
+                    | Self::AtomicCASLoop { .. }
+                    | Self::AtomicCAS128 { .. }
+                    | Self::AtomicRMW { .. }
+                    | Self::AtomicCAS { .. }
+                    | Self::LoadP64 { .. }
+                    | Self::FpuLoadP64 { .. }
+                    | Self::FpuLoadP128 { .. }
+            ) {
+                regalloc2::OperandPos::Late
+            } else {
+                regalloc2::OperandPos::Early
+            },
+        )
     }
 
     fn gen_move(to_reg: Writable<Reg>, from_reg: Reg, ty: Type) -> Inst {
@@ -1658,6 +1750,7 @@ impl Inst {
                     scratch,
                 )
             }
+            Inst::AtomicCAS128 { data } => format!("atomic_cas128 {data:?}"),
             &Inst::LoadAcquire {
                 access_ty, rt, rn, ..
             } => {
@@ -2920,6 +3013,8 @@ impl Inst {
             &Inst::SequencePoint {} => {
                 format!("sequence_point")
             }
+            Inst::NixeBoundary { data } => format!("nixe_boundary {data:?}"),
+            Inst::NixeArenaAddr { offset, dst } => format!("nixe_arena_addr {offset:?}, {dst:?}"),
             &Inst::StackProbeLoop { start, end, step } => {
                 let start = pretty_print_reg(start.to_reg());
                 let end = pretty_print_reg(end);

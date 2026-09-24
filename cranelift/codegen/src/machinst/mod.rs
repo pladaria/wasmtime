@@ -290,6 +290,11 @@ pub trait MachInst: Clone + Debug {
     /// Is this an "args" pseudoinst?
     fn is_args(&self) -> bool;
 
+    /// Does this instruction define all inputs of a Nixe external entry?
+    fn is_nixe_entry(&self) -> bool {
+        false
+    }
+
     /// Classify the type of call instruction this is.
     ///
     /// This enables more granular function type analysis and optimization.
@@ -304,6 +309,13 @@ pub trait MachInst: Clone + Debug {
 
     /// Does this instruction access memory?
     fn is_mem_access(&self) -> bool;
+
+    /// Prefault operand position: early for precise single memory instructions,
+    /// late when a compound operation can fault after writing a definition.
+    /// None means no memory fault; emission checks this inside Nixe fault spans.
+    fn nixe_fault_operand_pos(&self) -> Option<regalloc2::OperandPos> {
+        None
+    }
 
     /// Generate a move.
     fn gen_move(to_reg: Writable<Reg>, from_reg: Reg, ty: Type) -> Self;

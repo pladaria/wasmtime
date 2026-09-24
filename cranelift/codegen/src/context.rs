@@ -184,6 +184,8 @@ impl Context {
 
         self.verify_if(isa)?;
 
+        crate::nixe::validate_entries(&self.func, isa)?;
+        crate::nixe::validate_exit_metadata(&self.func)?;
         self.compute_cfg();
         self.compute_domtree();
         self.eliminate_unreachable_code(isa)?;
@@ -290,6 +292,11 @@ impl Context {
 
     /// Perform NaN canonicalizing rewrites on the function.
     pub fn canonicalize_nans(&mut self, isa: &dyn TargetIsa) -> CodegenResult<()> {
+        if self.func.nixe_observable_fp {
+            return Err(crate::CodegenError::Unsupported(
+                "Nixe observable FP is incompatible with NaN canonicalization".into(),
+            ));
+        }
         // Currently only RiscV64 is the only arch that may not have vector support.
         let has_vector_support = match isa.triple().architecture {
             Architecture::Riscv64(_) => match isa.isa_flags().iter().find(|f| f.name == "has_v") {
